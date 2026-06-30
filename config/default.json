@@ -1,0 +1,32 @@
+{
+  "camera": {
+    "index": 0,
+    "width": 1280,
+    "height": 720,
+    "fourcc": "MJPG"
+  },
+  "recognition": {
+    "gray_threshold": 175,
+    "roi_bottom_left_x": 0.18,
+    "roi_bottom_right_x": 0.82,
+    "roi_top_left_x": 0.35,
+    "roi_top_right_x": 0.65,
+    "roi_top_y": 0.55,
+    "sample_y_ratio": 0.78,
+    "row_thickness": 14,
+    "lane_width_px": 360
+  },
+  "decision": {
+    "base_speed": 75,
+    "max_speed": 140,
+    "max_steering": 120,
+    "steering_kp": 95.0,
+    "steering_sign": 1,
+    "min_lane_confidence": 0.2
+  },
+  "control": {
+    "serial_port": null,
+    "baudrate": 115200,
+    "send_interval_s": 0.05
+  }
+}

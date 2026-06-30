@@ -1,24 +1,31 @@
-# SKKU AI Autonomous Driving
+# SKKU Autocar
 
-성균관대 AI 자율주행 경진대회 SW 부문을 위한 Python/Arduino 프로젝트입니다.
+Mac에서 바로 실험할 수 있도록 ROS 없이 다시 구성한 자율주행 프로젝트입니다.
 
-현재 목표는 빠르게 실험하되, 대회 직전에 코드가 섞이지 않도록 센서, 인지, 판단, 제어, 미션 로직을 분리하는 것입니다. 초기 차선 검출 프로토타입은 `scripts/lanedetect.py`에 두고, 재사용 가능한 새 코드는 `src/skku_autocar/` 아래에 추가했습니다.
+전체 흐름은 네 단계입니다.
 
-## Structure
+```text
+camera       -> 카메라 프레임 입력
+recognition  -> 차선/객체 인식
+decision     -> 조향/속도 판단
+control      -> Arduino로 명령 전송
+```
 
-- `configs/`: 카메라, 라이다, 아두이노 포트, 제어 상수
-- `src/skku_autocar/sensors/`: 카메라와 라이다 입력
-- `src/skku_autocar/perception/`: 차선, 신호등, 장애물 인식
-- `src/skku_autocar/planning/`: 미션별 주행 판단
-- `src/skku_autocar/control/`: 아두이노 시리얼 프로토콜과 제어 명령
-- `firmware/arduino/`: 아두이노 차량 제어 스케치
-- `docs/`: 대회 규칙 요약, 아키텍처, 체크리스트
-- `scripts/`: 실험, 장치 확인, 프로토타입 실행 스크립트
-- `tests/`: 하드웨어 없이 돌릴 수 있는 순수 Python 테스트
+## Folder Roles
+
+자세한 역할 설명은 [docs/folder_roles.md](docs/folder_roles.md)에 정리했습니다.
+
+핵심 폴더:
+
+- `src/autocar/camera/`: 카메라 열기, 프레임 읽기
+- `src/autocar/recognition/`: 프레임에서 차선 정보 추출
+- `src/autocar/decision/`: 차선 정보로 주행 명령 계산
+- `src/autocar/control/`: 주행 명령을 Arduino serial 명령으로 변환/전송
+- `scripts/`: 실제 실행 스크립트
+- `config/`: 카메라, ROI, 속도, 포트 설정
+- `arduino/`: Arduino에 업로드할 제어 코드
 
 ## Setup
-
-대회 자료 기준 개발환경은 Python 3.9 계열을 전제로 잡았습니다.
 
 ```bash
 python3 -m venv .venv
@@ -27,28 +34,85 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-하드웨어 없이 구조와 명령 포맷만 확인:
+## Camera Probe
+
+폰 카메라나 내장 카메라 번호를 확인합니다.
 
 ```bash
-PYTHONPATH=src python3 -m skku_autocar --config configs/default.json dry-run
+python3 scripts/probe_cameras.py
 ```
 
-테스트:
+## Baseline Preview
+
+Arduino 없이 카메라/차선/판단만 확인합니다.
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests
+python3 scripts/run_baseline.py --config config/default.json --camera-index 0
 ```
 
-## Immediate Milestones
-
-1. `scripts/camera_check.py`로 카메라 번호, 해상도, ROI 확인
-2. `scripts/list_serial_ports.py`로 아두이노와 라이다 포트 고정
-3. `firmware/arduino/vehicle_controller/vehicle_controller.ino`의 핀 번호를 실제 배선에 맞게 수정 후 업로드
-4. `src/skku_autocar/perception/lane.py`의 차선 중심 추정값을 실제 트랙 영상으로 보정
-5. 시간측정 주행부터 안정화한 뒤 장애물, 신호등, 수직주차 모드를 추가
-
-기존 차선 검출 프로토타입 실행:
+폰 카메라가 1번이면:
 
 ```bash
-python3 scripts/lanedetect.py
+python3 scripts/run_baseline.py --config config/default.json --camera-index 1
 ```
+
+키:
+
+- `space`: 판단 시작/일시정지
+- `s`: 정지
+- `q`: 종료
+
+## Real Drive
+
+먼저 바퀴를 띄운 상태에서 테스트합니다.
+
+```bash
+python3 scripts/run_baseline.py \
+  --config config/default.json \
+  --camera-index 1 \
+  --serial-port /dev/cu.usbmodemXXXX \
+  --drive
+```
+
+차가 반대로 꺾이면 `config/default.json`의 `decision.steering_sign`을 `-1`로 바꾸면 됩니다.
+
+## Arduino
+
+[arduino/vehicle_controller/vehicle_controller.ino](arduino/vehicle_controller/vehicle_controller.ino)를 Arduino Mega에 업로드합니다.
+
+현재 코드의 배선 기준:
+
+```text
+오른쪽 뒷바퀴: IN1=D3,  IN2=D4
+왼쪽 뒷바퀴:   IN1=D7,  IN2=D8
+핸들:          IN1=D11, IN2=D12
+```
+
+Python 쪽에서 Arduino로 보내는 명령 형식:
+
+```text
+DRIVE <speed> <steering>
+STOP
+PING
+```
+
+예:
+
+```text
+DRIVE 80 -20
+STOP
+```
+
+업로드 후 바퀴를 띄운 상태에서 serial 테스트:
+
+```bash
+python3 scripts/test_serial.py --port /dev/cu.usbmodem14101
+```
+
+구동 바퀴까지 아주 낮은 속도로 테스트:
+
+```bash
+python3 scripts/test_serial.py --port /dev/cu.usbmodem14101 --speed 45
+```
+
+현재 구동 테스트에서 양쪽 뒷바퀴가 뒤로 돌아 `vehicle_controller.ino`의 `RIGHT_DRIVE_INVERT`, `LEFT_DRIVE_INVERT`는 `true`로 설정되어 있습니다. 한쪽 바퀴만 반대로 돌면 해당 값만 다시 조정하세요. 핸들이 반대로 움직이면 `STEERING_INVERT`를 `true`로 바꿉니다.

@@ -1,41 +1,29 @@
 # Architecture
 
-## Competition Constraints Reflected In Code
-
-- Track driving is counter-clockwise on the outer lane.
-- Time trial, obstacle/traffic-light mission, and vertical parking should be selectable modes, not separate rewrites.
-- After inspection, the hardware configuration must stay unchanged across matches.
-- The start signal rule means motor output should stay stopped until the operator explicitly starts the program mode.
-- A judge may stand outside the lane, so LiDAR obstacle logic should avoid treating every side measurement as a mission obstacle.
-
-## Data Flow
-
 ```text
-camera frame        lidar scan
-     |                  |
-     v                  v
-lane detector     obstacle filter
-     |                  |
-     +--------+---------+
-              v
-        mission planner
-              |
-              v
-       ControlCommand
-              |
-              v
-        Arduino serial
-              |
-              v
-      drive and steering motors
+OpenCV camera frame
+        |
+        v
+camera/camera_source.py
+        |
+        v
+recognition/opencv_lane.py
+        |
+        v
+decision/lane_follower.py
+        |
+        v
+control/protocol.py + control/arduino_serial.py
+        |
+        v
+Arduino motor controller
 ```
 
-## Module Boundaries
+원칙:
 
-- `sensors`: hardware IO only. No mission decisions.
-- `perception`: converts raw sensor data into lane, obstacle, or traffic-light estimates.
-- `planning`: chooses speed and steering from perception outputs and mission mode.
-- `control`: serial protocol and actuator command formatting.
-- `firmware`: receives simple serial commands and applies them to motor pins.
+- `camera`: 입력 장치만 다룬다.
+- `recognition`: 이미지에서 차선/객체를 찾는다.
+- `decision`: 인식 결과를 조향/속도로 바꾼다.
+- `control`: 명령을 하드웨어에 보낸다.
 
-Keep calibration values in `configs/default.json`. Avoid burying threshold numbers inside mission code once real track tuning starts.
+이렇게 나누면 YOLO를 추가할 때 `recognition/`만 교체하고, `decision/`과 `control/`은 그대로 쓸 수 있습니다.

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "skku-autocar"
 version = "0.1.0"
-description = "SKKU AI autonomous driving competition software stack"
+description = "Mac-friendly autonomous vehicle project split into camera, recognition, decision, and control layers."
 requires-python = ">=3.9"
 
 [tool.setuptools.packages.find]
