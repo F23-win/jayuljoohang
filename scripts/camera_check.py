@@ -47,8 +47,10 @@ def main() -> int:
                 (0, 255, 255),
                 2,
             )
+            cv2.imshow("raw camera", frame)
             cv2.imshow("camera lane check", overlay)
             cv2.imshow("lane mask", result.lane_mask)
+            cv2.imshow("canny edge", result.edge_mask)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     cv2.destroyAllWindows()

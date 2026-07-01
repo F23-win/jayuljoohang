@@ -10,6 +10,7 @@ class LaneDetectionResult:
     estimate: LaneEstimate
     gray: Any
     binary_mask: Any
+    edge_mask: Any
     lane_mask: Any
     roi_points: Any
     inverse_perspective: Any
@@ -49,17 +50,19 @@ class LaneDetector:
         )
         edge_kernel = np.ones((3, 3), np.uint8)
         edge_mask = cv2.dilate(edges, edge_kernel, iterations=1)
-        binary_mask = cv2.bitwise_and(
-            white_mask,
-            cv2.bitwise_or(tophat_mask, edge_mask),
+        bright_mask = cv2.inRange(gray, self.config.edge_brightness_min, 255)
+        bright_edge_mask = cv2.bitwise_and(edge_mask, bright_mask)
+
+        binary_mask = cv2.bitwise_or(
+            cv2.bitwise_and(white_mask, cv2.bitwise_or(tophat_mask, bright_mask)),
+            cv2.bitwise_or(tophat_mask, bright_edge_mask),
         )
 
         roi_mask, roi_points = self._make_roi_mask(frame.shape, np, cv2)
         lane_mask = cv2.bitwise_and(binary_mask, roi_mask)
 
         kernel = np.ones((3, 3), np.uint8)
-        lane_mask = cv2.morphologyEx(lane_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        lane_mask = cv2.morphologyEx(lane_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        lane_mask = cv2.morphologyEx(lane_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
         src, dst = self._make_birds_eye_points(frame.shape, np)
         perspective = cv2.getPerspectiveTransform(src, dst)
@@ -79,6 +82,7 @@ class LaneDetector:
             estimate=estimate,
             gray=gray,
             binary_mask=binary_mask,
+            edge_mask=edge_mask,
             lane_mask=filtered_mask,
             roi_points=roi_points,
             inverse_perspective=inverse_perspective,

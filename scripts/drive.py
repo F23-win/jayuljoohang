@@ -1,13 +1,15 @@
 import cv2
 import numpy as np
+import platform
 import time
 import serial
+from pathlib import Path
 
 # =========================================================
 # 시리얼 (아두이노 메가) 설정
 # =========================================================
 
-SERIAL_PORT = "COM6"
+SERIAL_PORT = "/dev/cu.usbmodem112301"
 SERIAL_BAUD = 115200
 
 # =========================================================
@@ -31,9 +33,21 @@ LOST_FRAMES_BEFORE_STOP = 8
 # 카메라 설정
 # =========================================================
 
-CAMERA_INDEX = 1
+CAMERA_INDEX = 2
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 360
+
+# =========================================================
+# YOLO segmentation 설정
+# =========================================================
+
+# 차선 segmentation으로 학습된 YOLO 모델이 있으면 이 경로에 둔다.
+# 모델/ultralytics가 없으면 기존 CV 차선 검출로 자동 fallback 한다.
+USE_YOLO = True
+YOLO_MODEL_PATH = "models/lane_seg.pt"
+YOLO_CONFIDENCE = 0.25
+YOLO_IMAGE_SIZE = 640
+YOLO_LANE_CLASS_NAMES = {"lane", "lane2", "road_lane", "road_line", "line"}
 
 # =========================================================
 # 차선 검출 설정
@@ -42,8 +56,8 @@ FRAME_HEIGHT = 360
 # --- HSV 흰색 필터 ---
 # PDF의 색상 필터링 단계. 흰색 차선은 채도(S)가 낮고 밝기(V)가 높다는 성질을 이용한다.
 # 실내 조명 때문에 차선이 끊기면 HSV_WHITE_V_MIN을 낮추고, 흰색 물체가 많으면 S_MAX를 낮춘다.
-HSV_WHITE_S_MAX = 80
-HSV_WHITE_V_MIN = 150
+HSV_WHITE_S_MAX = 110
+HSV_WHITE_V_MIN = 115
 
 # --- top-hat (빛 반사 제거 핵심) ---
 # 이 커널보다 '두꺼운' 밝은 영역(바닥 반사 덩어리)은 제거되고,
@@ -56,11 +70,12 @@ TOPHAT_THRESHOLD = 30
 
 # --- Canny Edge ---
 # PDF의 edge 검출 단계. 밝은 차선 후보 중 기하학적 경계가 있는 픽셀을 더 신뢰한다.
-CANNY_LOW_THRESHOLD = 50
-CANNY_HIGH_THRESHOLD = 150
+CANNY_LOW_THRESHOLD = 35
+CANNY_HIGH_THRESHOLD = 110
+EDGE_BRIGHTNESS_MIN = 95
 
 # --- 컨투어 크기 필터 ---
-MIN_CONTOUR_AREA = 250
+MIN_CONTOUR_AREA = 120
 MAX_LANE_PARTS = 4
 
 # --- 모양 필터 (반사 덩어리 제거 핵심) ---
@@ -72,18 +87,18 @@ MIN_ELONGATION = 2.2
 # --- 차선 전용 기하 필터 ---
 # 흰색 물체가 같이 잡히는 문제를 줄이기 위해, "길고 얇은 흰색"뿐 아니라
 # 카메라 아래쪽 바닥 ROI에서 수직/대각선으로 이어지는 조각만 차선 후보로 본다.
-MIN_CONTOUR_HEIGHT = 28
+MIN_CONTOUR_HEIGHT = 20
 MAX_CONTOUR_WIDTH_RATIO = 0.30
-MIN_CONTOUR_BOTTOM_Y = 0.55
+MIN_CONTOUR_BOTTOM_Y = 0.50
 MAX_ANGLE_FROM_VERTICAL = 65.0
 
 # --- Bird's Eye View ---
 # PDF의 원근 변환 단계. 실제 카메라 설치각에 따라 아래 source 점은 현장에서 보정해야 한다.
 BIRD_SRC_BOTTOM_LEFT_X = 0.05
 BIRD_SRC_BOTTOM_RIGHT_X = 0.95
-BIRD_SRC_TOP_LEFT_X = 0.28
-BIRD_SRC_TOP_RIGHT_X = 0.72
-BIRD_SRC_TOP_Y = 0.58
+BIRD_SRC_TOP_LEFT_X = 0.34
+BIRD_SRC_TOP_RIGHT_X = 0.66
+BIRD_SRC_TOP_Y = 0.42
 BIRD_DST_LEFT_X = 0.25
 BIRD_DST_RIGHT_X = 0.75
 
@@ -91,9 +106,9 @@ BIRD_DST_RIGHT_X = 0.75
 # PDF의 sliding window 기반 추적 단계. BEV 마스크에서 차선 픽셀 중심을 아래에서 위로 추적한다.
 SLIDING_WINDOWS = 9
 SLIDING_MARGIN = 55
-SLIDING_MIN_PIXELS = 25
-SLIDING_MIN_HISTOGRAM = 2000
-SLIDING_MIN_FIT_PIXELS = 70
+SLIDING_MIN_PIXELS = 12
+SLIDING_MIN_HISTOGRAM = 800
+SLIDING_MIN_FIT_PIXELS = 45
 SLIDING_LOOKAHEAD_Y = 0.65
 MIN_LANE_WIDTH_RATIO = 0.25
 MAX_LANE_WIDTH_RATIO = 0.85
@@ -105,9 +120,9 @@ SINGLE_LANE_CENTER_OFFSET_RATIO = 0.24
 
 ROI_BOTTOM_LEFT_X = 0
 ROI_BOTTOM_RIGHT_X = 1
-ROI_TOP_LEFT_X = 0.1
-ROI_TOP_RIGHT_X = 0.9
-ROI_TOP_Y = 0.6
+ROI_TOP_LEFT_X = 0.05
+ROI_TOP_RIGHT_X = 0.95
+ROI_TOP_Y = 0.42
 
 
 def make_roi_mask(frame_shape):
@@ -142,6 +157,19 @@ def make_birds_eye_points(frame_shape):
     return src, dst
 
 
+def warp_to_birds_eye(mask, frame_shape):
+    src, dst = make_birds_eye_points(frame_shape)
+    perspective = cv2.getPerspectiveTransform(src, dst)
+    inverse_perspective = cv2.getPerspectiveTransform(dst, src)
+    warped_mask = cv2.warpPerspective(
+        mask,
+        perspective,
+        (frame_shape[1], frame_shape[0]),
+        flags=cv2.INTER_NEAREST,
+    )
+    return warped_mask, inverse_perspective
+
+
 def detect_lane(frame):
     """
     PDF의 YOLO 제외 CV 파이프라인 반영:
@@ -172,31 +200,119 @@ def detect_lane(frame):
     edges = cv2.Canny(blurred, CANNY_LOW_THRESHOLD, CANNY_HIGH_THRESHOLD)
     edge_kernel = np.ones((3, 3), np.uint8)
     edge_mask = cv2.dilate(edges, edge_kernel, iterations=1)
+    bright_mask = cv2.inRange(gray, EDGE_BRIGHTNESS_MIN, 255)
+    bright_edge_mask = cv2.bitwise_and(edge_mask, bright_mask)
 
-    thin_white_mask = cv2.bitwise_and(
-        white_mask,
-        cv2.bitwise_or(tophat_mask, edge_mask),
+    # HSV가 놓친 흰 차선 경계도 살리기 위해 edge 후보를 별도 경로로 합친다.
+    lane_candidate_mask = cv2.bitwise_or(
+        cv2.bitwise_and(white_mask, cv2.bitwise_or(tophat_mask, bright_mask)),
+        cv2.bitwise_or(tophat_mask, bright_edge_mask),
     )
 
     roi_mask, roi_points = make_roi_mask(frame.shape)
-    lane_mask = cv2.bitwise_and(thin_white_mask, roi_mask)
+    lane_mask = cv2.bitwise_and(lane_candidate_mask, roi_mask)
 
     kernel = np.ones((3, 3), np.uint8)
-    lane_mask = cv2.morphologyEx(lane_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    lane_mask = cv2.morphologyEx(lane_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    lane_mask = cv2.morphologyEx(lane_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    src, dst = make_birds_eye_points(frame.shape)
-    perspective = cv2.getPerspectiveTransform(src, dst)
-    inverse_perspective = cv2.getPerspectiveTransform(dst, src)
-    warped_mask = cv2.warpPerspective(
-        lane_mask,
-        perspective,
-        (frame.shape[1], frame.shape[0]),
-        flags=cv2.INTER_NEAREST,
-    )
+    warped_mask, inverse_perspective = warp_to_birds_eye(lane_mask, frame.shape)
     warped_mask = cv2.morphologyEx(warped_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    return warped_mask, roi_points, inverse_perspective
+    return warped_mask, roi_points, inverse_perspective, edge_mask
+
+
+class YoloLaneSegmenter:
+    def __init__(self, model_path):
+        self.model = None
+        self.names = {}
+        self.error = None
+
+        if not USE_YOLO:
+            self.error = "YOLO disabled"
+            return
+
+        path = Path(model_path)
+        if not path.exists():
+            self.error = f"YOLO model not found: {model_path}"
+            return
+
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            self.error = "ultralytics is not installed"
+            return
+
+        try:
+            self.model = YOLO(str(path))
+            self.names = getattr(self.model, "names", {}) or {}
+        except Exception as exc:
+            self.error = f"YOLO load failed: {exc}"
+            self.model = None
+
+    def ready(self):
+        return self.model is not None
+
+    def segment(self, frame):
+        if self.model is None:
+            return None
+
+        results = self.model.predict(
+            frame,
+            imgsz=YOLO_IMAGE_SIZE,
+            conf=YOLO_CONFIDENCE,
+            retina_masks=True,
+            verbose=False,
+        )
+        if not results:
+            return None
+
+        result = results[0]
+        if result.masks is None or result.masks.data is None:
+            return None
+
+        masks = result.masks.data
+        if hasattr(masks, "detach"):
+            masks = masks.detach().cpu().numpy()
+        else:
+            masks = np.asarray(masks)
+        if masks.size == 0:
+            return None
+
+        selected_masks = self._select_lane_masks(result, masks)
+        if not selected_masks:
+            return None
+
+        lane_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        for mask in selected_masks:
+            if mask.shape != lane_mask.shape:
+                mask = cv2.resize(mask, (lane_mask.shape[1], lane_mask.shape[0]), interpolation=cv2.INTER_NEAREST)
+            lane_mask[mask > 0.5] = 255
+
+        if cv2.countNonZero(lane_mask) == 0:
+            return None
+        return lane_mask
+
+    def _select_lane_masks(self, result, masks):
+        classes = None
+        if result.boxes is not None and result.boxes.cls is not None:
+            classes = result.boxes.cls
+            if hasattr(classes, "detach"):
+                classes = classes.detach().cpu().numpy()
+            else:
+                classes = np.asarray(classes)
+
+        names = getattr(result, "names", None) or self.names
+        selected = []
+        if classes is not None and names:
+            for index, cls_id in enumerate(classes.astype(int)):
+                class_name = str(names.get(cls_id, cls_id)).lower()
+                if class_name in YOLO_LANE_CLASS_NAMES:
+                    selected.append(masks[index])
+
+        # 차선 전용 segmentation 모델이면 class 이름이 달라도 mask 전체를 사용한다.
+        if not selected and len(masks) <= 2:
+            selected = [mask for mask in masks]
+        return selected
 
 
 def mask_from_contours(mask_shape, lane_contours):
@@ -399,11 +515,80 @@ def send_stop(ser):
     ser.write(b"STOP\n")
 
 
+def camera_backend_candidates():
+    system = platform.system()
+    candidates = []
+    if system == "Darwin" and hasattr(cv2, "CAP_AVFOUNDATION"):
+        candidates.append(("AVFOUNDATION", cv2.CAP_AVFOUNDATION))
+    elif system == "Windows" and hasattr(cv2, "CAP_DSHOW"):
+        candidates.append(("DSHOW", cv2.CAP_DSHOW))
+    candidates.append(("DEFAULT", cv2.CAP_ANY))
+    return candidates
+
+
+def camera_index_candidates():
+    candidates = [CAMERA_INDEX, 0, 1, 2, 3]
+    unique = []
+    for index in candidates:
+        if index not in unique:
+            unique.append(index)
+    return unique
+
+
+def is_usable_camera_frame(frame):
+    if frame is None:
+        return False
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # macOS 권한/잘못된 index 문제는 순검정 프레임으로 들어오는 경우가 많다.
+    return float(np.mean(gray)) >= 5.0 or float(np.std(gray)) >= 5.0
+
+
+def describe_camera_frame(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return "mean=%.1f std=%.1f" % (float(np.mean(gray)), float(np.std(gray)))
+
+
+def open_camera():
+    for index in camera_index_candidates():
+        for backend_name, backend in camera_backend_candidates():
+            cap = cv2.VideoCapture(index, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
+
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+            if platform.system() == "Windows":
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
+            for _ in range(10):
+                ok, frame = cap.read()
+                if ok and is_usable_camera_frame(frame):
+                    print(f"카메라 연결 완료: index={index}, backend={backend_name}")
+                    return cap
+                time.sleep(0.05)
+
+            if ok and frame is not None:
+                print(
+                    f"검정 프레임 카메라 건너뜀: index={index}, "
+                    f"backend={backend_name}, {describe_camera_frame(frame)}"
+                )
+            cap.release()
+
+    return None
+
+
 # =========================================================
 # 메인 주행 루프
 # =========================================================
 
 def main():
+    yolo_segmenter = YoloLaneSegmenter(YOLO_MODEL_PATH)
+    if yolo_segmenter.ready():
+        print(f"YOLO 차선 모델 사용: {YOLO_MODEL_PATH}")
+    else:
+        print(f"YOLO 비활성화: {yolo_segmenter.error} -> CV fallback")
+
     try:
         ser = open_serial()
         print("시리얼 연결 완료:", SERIAL_PORT)
@@ -412,13 +597,9 @@ def main():
         print("COM6가 맞는지, 시리얼 모니터/다른 프로그램이 점유 중인지 확인하세요.")
         return
 
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-
-    if not cap.isOpened():
-        print("카메라를 열 수 없습니다. CAMERA_INDEX를 0, 1, 2로 바꿔보세요.")
+    cap = open_camera()
+    if cap is None:
+        print("카메라 프레임을 읽을 수 없습니다. macOS 카메라 권한과 CAMERA_INDEX를 확인하세요.")
         send_stop(ser)
         ser.close()
         return
@@ -438,7 +619,17 @@ def main():
 
             frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
 
-            raw_lane_mask, roi_points, inverse_perspective = detect_lane(frame)
+            yolo_lane_mask = yolo_segmenter.segment(frame)
+            if yolo_lane_mask is not None:
+                roi_mask, roi_points = make_roi_mask(frame.shape)
+                yolo_lane_mask = cv2.bitwise_and(yolo_lane_mask, roi_mask)
+                raw_lane_mask, inverse_perspective = warp_to_birds_eye(yolo_lane_mask, frame.shape)
+                edge_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+                detector_mode = "YOLO"
+            else:
+                raw_lane_mask, roi_points, inverse_perspective, edge_mask = detect_lane(frame)
+                detector_mode = "CV"
+
             lane_contours = select_lane_contours(raw_lane_mask)
             lane_mask = mask_from_contours(raw_lane_mask.shape, lane_contours)
             lane_center_x = compute_lane_center_x(lane_mask)
@@ -494,14 +685,14 @@ def main():
 
                 if driving:
                     send_drive(ser, speed_cmd, steer_cmd)
-                status = f"DRIVE s={speed_cmd} st={steer_cmd}"
+                status = f"{detector_mode} DRIVE s={speed_cmd} st={steer_cmd}"
             else:
                 lost_count += 1
                 if driving and lost_count >= LOST_FRAMES_BEFORE_STOP:
                     send_stop(ser)
-                    status = "LANE LOST -> STOP"
+                    status = f"{detector_mode} LANE LOST -> STOP"
                 else:
-                    status = f"LANE LOST ({lost_count})"
+                    status = f"{detector_mode} LANE LOST ({lost_count})"
 
             mode = "RUN" if driving else "PAUSE"
             color = (0, 255, 0) if driving else (0, 0, 255)
@@ -517,7 +708,11 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
             cv2.imshow("Drive", result)
+            cv2.imshow("Raw Camera", frame)
             cv2.imshow("BEV Lane Mask", lane_mask)
+            cv2.imshow("Canny Edge", edge_mask)
+            if yolo_lane_mask is not None:
+                cv2.imshow("YOLO Lane Mask", yolo_lane_mask)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
