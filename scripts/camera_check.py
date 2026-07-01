@@ -24,8 +24,17 @@ def main() -> int:
             result = detector.detect(frame)
             overlay = frame.copy()
             cv2.polylines(overlay, result.roi_points, True, (255, 0, 0), 2)
-            for contour in result.contours:
-                cv2.drawContours(overlay, [contour], -1, (0, 255, 0), 3)
+            original_lane_mask = cv2.warpPerspective(
+                result.lane_mask,
+                result.inverse_perspective,
+                (frame.shape[1], frame.shape[0]),
+                flags=cv2.INTER_NEAREST,
+            )
+            lane_pixels = original_lane_mask > 0
+            overlay[lane_pixels] = (
+                overlay[lane_pixels] * 0.45
+                + (0, 140, 0)
+            ).astype("uint8")
             cv2.putText(
                 overlay,
                 "offset=%.3f confidence=%.2f" % (

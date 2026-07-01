@@ -21,6 +21,33 @@ class LaneConfig:
     roi_top_left_x: float = 0.35
     roi_top_right_x: float = 0.65
     roi_top_y: float = 0.55
+    hsv_white_s_max: int = 80
+    hsv_white_v_min: int = 150
+    tophat_kernel_size: int = 25
+    tophat_threshold: int = 30
+    canny_low_threshold: int = 50
+    canny_high_threshold: int = 150
+    min_elongation: float = 2.2
+    min_contour_height: int = 28
+    max_contour_width_ratio: float = 0.30
+    min_contour_bottom_y: float = 0.55
+    max_angle_from_vertical: float = 65.0
+    bird_src_bottom_left_x: float = 0.05
+    bird_src_bottom_right_x: float = 0.95
+    bird_src_top_left_x: float = 0.28
+    bird_src_top_right_x: float = 0.72
+    bird_src_top_y: float = 0.58
+    bird_dst_left_x: float = 0.25
+    bird_dst_right_x: float = 0.75
+    sliding_windows: int = 9
+    sliding_margin: int = 55
+    sliding_min_pixels: int = 25
+    sliding_min_histogram: int = 2000
+    sliding_min_fit_pixels: int = 70
+    sliding_lookahead_y: float = 0.65
+    min_lane_width_ratio: float = 0.25
+    max_lane_width_ratio: float = 0.85
+    single_lane_center_offset_ratio: float = 0.24
 
 
 @dataclass(frozen=True)
