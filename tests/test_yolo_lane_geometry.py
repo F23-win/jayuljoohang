@@ -2,6 +2,7 @@ import unittest
 
 import numpy as np
 
+from skku_autocar.estimation.bev import BirdEyeViewConfig, BirdEyeViewTransformer
 from skku_autocar.estimation.lane_geometry import LaneGeometry, LaneGeometryConfig, MaskLaneGeometryEstimator
 from skku_autocar.perception.yolo_lane import YoloLaneConfig, YoloLaneSegmenter
 from skku_autocar.planning.yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
@@ -44,6 +45,28 @@ class YoloLaneGeometryTest(unittest.TestCase):
 
         self.assertTrue(lane.lateral_error_norm > 0)
         self.assertTrue(command.steering > 0)
+
+    def test_bev_disabled_returns_original_inputs(self):
+        frame = np.zeros((100, 200, 3), dtype=np.uint8)
+        mask = np.zeros((100, 200), dtype=np.uint8)
+
+        bev = BirdEyeViewTransformer(BirdEyeViewConfig(enabled=False))
+
+        self.assertIs(bev.warp_frame(frame), frame)
+        self.assertIs(bev.warp_mask(mask, frame.shape), mask)
+
+    def test_bev_warp_keeps_centered_mask_near_center(self):
+        mask = np.zeros((100, 200), dtype=np.uint8)
+        mask[42:98, 96:104] = 255
+
+        bev = BirdEyeViewTransformer()
+        warped = bev.warp_mask(mask, (100, 200, 3))
+        lane = MaskLaneGeometryEstimator(
+            LaneGeometryConfig(sample_top_y_ratio=0.30, sample_bottom_y_ratio=0.95)
+        ).estimate(warped, (100, 200, 3))
+
+        self.assertTrue(lane.found)
+        self.assertAlmostEqual(lane.lateral_error_norm, 0.0, delta=0.08)
 
     def test_missing_mask_stops(self):
         lane = MaskLaneGeometryEstimator().estimate(None, (100, 200, 3))

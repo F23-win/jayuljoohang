@@ -12,7 +12,7 @@ if str(SRC) not in sys.path:
 from skku_autocar.estimation.lane_geometry import LaneGeometryConfig, MaskLaneGeometryEstimator
 from skku_autocar.perception.yolo_lane import YoloLaneConfig, YoloLaneSegmenter
 from skku_autocar.planning.yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
-from skku_autocar.runtime.yolo_drive_app import draw_debug, resolve_model_path
+from skku_autocar.runtime.yolo_drive_app import apply_geometry_view, build_bev_transformer, draw_debug, resolve_model_path
 
 
 def main() -> int:
@@ -38,6 +38,7 @@ def main() -> int:
             device=args.device,
         )
     )
+    bev = build_bev_transformer(args)
     estimator = MaskLaneGeometryEstimator(
         LaneGeometryConfig(
             lookahead_y_ratio=args.lookahead,
@@ -115,11 +116,24 @@ def main() -> int:
 
         if processed % args.stride == 0:
             mask_result = segmenter.segment(frame)
-            lane = estimator.estimate(mask_result.mask if mask_result else None, frame.shape)
+            geometry_frame, geometry_mask_result = apply_geometry_view(frame, mask_result, bev)
+            lane = estimator.estimate(
+                geometry_mask_result.mask if geometry_mask_result else None,
+                geometry_frame.shape,
+            )
             command = follower.plan(lane)
             if not lane.found:
                 lost += 1
-            display = draw_debug(cv2, frame, mask_result, lane, command, True, source_fps)
+            display = draw_debug(
+                cv2,
+                geometry_frame,
+                geometry_mask_result,
+                lane,
+                command,
+                True,
+                source_fps,
+                "BEV" if bev.enabled else "camera",
+            )
             writer.write(display)
             written += 1
 
@@ -136,6 +150,7 @@ def main() -> int:
     print("input=%s" % input_path)
     print("model=%s" % model_path)
     print("device=%s" % segmenter.device)
+    print("view=%s" % ("bev" if bev.enabled else "camera"))
     print("output=%s" % output_path)
     print("processed=%d written=%d lost=%d elapsed=%.1fs" % (processed, written, lost, elapsed))
     return 0
@@ -182,6 +197,12 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="vehicle center x offset as frame width ratio; positive makes centered targets steer left",
     )
+    parser.add_argument("--bev", choices=("on", "off"), default="on", help="use bird's-eye-view geometry")
+    parser.add_argument("--bev-src-top-y", type=float, default=0.42)
+    parser.add_argument("--bev-src-bottom-y", type=float, default=0.98)
+    parser.add_argument("--bev-src-top-width", type=float, default=0.42)
+    parser.add_argument("--bev-src-bottom-width", type=float, default=0.94)
+    parser.add_argument("--bev-dst-margin-x", type=float, default=0.12)
     return parser.parse_args()
 
 

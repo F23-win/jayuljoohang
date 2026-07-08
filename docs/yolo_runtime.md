@@ -5,6 +5,7 @@
 ```text
 camera frame
   -> YOLO segmentation mask
+  -> optional BEV perspective transform
   -> mask row sampling
   -> vehicle center vs target center error
   -> speed / steering command
@@ -71,10 +72,27 @@ python3 scripts/drive.py --serial-port /dev/cu.usbmodem113301
 ## 튜닝 우선순위
 
 1. `--no-serial --show-mask`로 YOLO mask가 도로/차선을 제대로 덮는지 확인한다.
-2. mask가 안정적이면 `--lookahead`, `--sample-top`, `--sample-bottom`으로 어느 깊이의 mask를 중심 계산에 쓸지 조절한다.
-3. 직진에서 계속 한쪽으로 붙으면 `--vehicle-center-offset`으로 차량 기준 중심을 보정한다. 오른쪽으로 붙으면 양수, 왼쪽으로 붙으면 음수부터 시도한다.
-4. 조향각이 부족하거나 커브 진입이 늦으면 먼저 `--kp-lateral`, `--curve-steering-scale`, `--steering-rate-limit`을 올린다. 중심에서 멀어졌을 때 빨리 복귀시키려면 `--center-recovery-*` 옵션을 조절한다. `--kp-heading`은 보조값으로만 작게 조절한다.
-5. 커브에 너무 빨리 들어가면 `--min-curve-speed`를 낮추거나 `--speed-curve-slowdown`을 올린다. 직선 속도는 `--speed`로 올린다.
+2. 이 브랜치는 기본으로 `--bev on`을 사용한다. 기존 카메라 좌표계와 비교하려면 `--bev off`를 붙인다.
+3. mask가 안정적이면 `--lookahead`, `--sample-top`, `--sample-bottom`으로 어느 깊이의 mask를 중심 계산에 쓸지 조절한다.
+4. 직진에서 계속 한쪽으로 붙으면 `--vehicle-center-offset`으로 차량 기준 중심을 보정한다. 오른쪽으로 붙으면 양수, 왼쪽으로 붙으면 음수부터 시도한다.
+5. 조향각이 부족하거나 커브 진입이 늦으면 먼저 `--kp-lateral`, `--curve-steering-scale`, `--steering-rate-limit`을 올린다. 중심에서 멀어졌을 때 빨리 복귀시키려면 `--center-recovery-*` 옵션을 조절한다. `--kp-heading`은 보조값으로만 작게 조절한다.
+6. 커브에 너무 빨리 들어가면 `--min-curve-speed`를 낮추거나 `--speed-curve-slowdown`을 올린다. 직선 속도는 `--speed`로 올린다.
+
+## BEV
+
+`--bev on`은 YOLO mask를 원본 이미지에서 얻은 뒤, 주행 판단용 mask를 bird's-eye-view 좌표로 펴서 `err`와 `heading`을 계산한다. 원근 때문에 가까운 차선이 과하게 커 보이는 영향을 줄이고, 좌우 오차를 더 일정하게 해주는 효과가 있다.
+
+기본 BEV ROI는 아래 옵션으로 조절한다.
+
+```bash
+--bev-src-top-y 0.42 \
+--bev-src-bottom-y 0.98 \
+--bev-src-top-width 0.42 \
+--bev-src-bottom-width 0.94 \
+--bev-dst-margin-x 0.12
+```
+
+횡단보도처럼 화면 아래쪽 흰 선이 많을 때는 BEV만으로 모든 문제를 없애지는 못한다. YOLO mask가 순간적으로 비면 여전히 `lane_lost`가 날 수 있으므로, 그 경우 `--sample-top 0.45 --sample-bottom 0.85`처럼 샘플 영역을 조금 위로 당기는 것이 같이 필요하다.
 
 조향이 부족할 때 시작점:
 

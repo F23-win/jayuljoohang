@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ..control.serial_vehicle import SerialVehicleClient, SerialVehicleConfig
+from ..estimation.bev import BirdEyeViewConfig, BirdEyeViewTransformer
 from ..estimation.lane_geometry import LaneGeometry, LaneGeometryConfig, MaskLaneGeometryEstimator
 from ..perception.yolo_lane import YoloLaneConfig, YoloLaneMask, YoloLaneSegmenter
 from ..planning.yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
@@ -45,6 +46,7 @@ def run(args: argparse.Namespace) -> int:
             device=args.device,
         )
     )
+    bev = build_bev_transformer(args)
     estimator = MaskLaneGeometryEstimator(
         LaneGeometryConfig(
             lookahead_y_ratio=args.lookahead,
@@ -108,6 +110,7 @@ def run(args: argparse.Namespace) -> int:
     command = ControlCommand.stop("paused")
 
     LOG.info("model=%s device=%s camera=%s", model_path, segmenter.device, args.camera)
+    LOG.info("geometry view=%s", "bev" if bev.enabled else "camera")
     if recorder.enabled:
         LOG.info("recording raw video: %s", recorder.raw_video_path)
         if recorder.debug_video_path is not None:
@@ -131,21 +134,42 @@ def run(args: argparse.Namespace) -> int:
             last_frame_at = now
 
             mask_result = segmenter.segment(frame)
-            lane = estimator.estimate(mask_result.mask if mask_result else None, frame.shape)
+            geometry_frame, geometry_mask_result = apply_geometry_view(frame, mask_result, bev)
+            lane = estimator.estimate(
+                geometry_mask_result.mask if geometry_mask_result else None,
+                geometry_frame.shape,
+            )
             command = follower.plan(lane) if running else ControlCommand.stop("paused")
 
             if vehicle is not None and now - last_command_at >= 1.0 / args.command_rate:
                 vehicle.send(command)
                 last_command_at = now
 
-            display = draw_debug(cv2, frame, mask_result, lane, command, running, fps)
+            display = draw_debug(
+                cv2,
+                geometry_frame,
+                geometry_mask_result,
+                lane,
+                command,
+                running,
+                fps,
+                "BEV" if bev.enabled else "camera",
+            )
             recorder.write(frame, display)
             cv2.imshow("YOLO Drive", display)
-            if args.show_mask and mask_result is not None:
-                cv2.imshow("YOLO Lane Mask", mask_result.mask)
+            if args.show_mask and geometry_mask_result is not None:
+                cv2.imshow("YOLO Lane Mask", geometry_mask_result.mask)
 
             if now - last_log_at >= args.log_interval:
-                log_status(mask_result, lane, command, running, fps, segmenter.device)
+                log_status(
+                    geometry_mask_result,
+                    lane,
+                    command,
+                    running,
+                    fps,
+                    segmenter.device,
+                    "bev" if bev.enabled else "camera",
+                )
                 last_log_at = now
 
             key = cv2.waitKey(1) & 0xFF
@@ -213,6 +237,12 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         default=0.0,
         help="vehicle center x offset as frame width ratio; positive makes centered targets steer left",
     )
+    parser.add_argument("--bev", choices=("on", "off"), default="on", help="use bird's-eye-view geometry")
+    parser.add_argument("--bev-src-top-y", type=float, default=0.42)
+    parser.add_argument("--bev-src-bottom-y", type=float, default=0.98)
+    parser.add_argument("--bev-src-top-width", type=float, default=0.42)
+    parser.add_argument("--bev-src-bottom-width", type=float, default=0.94)
+    parser.add_argument("--bev-dst-margin-x", type=float, default=0.12)
     parser.add_argument("--command-rate", type=float, default=20.0)
     parser.add_argument("--log-interval", type=float, default=0.5)
     parser.add_argument("--show-mask", action="store_true")
@@ -244,6 +274,43 @@ def resolve_model_path(value: str) -> Path:
 
 def project_root() -> Path:
     return Path(__file__).resolve().parents[3]
+
+
+def build_bev_transformer(args: argparse.Namespace) -> BirdEyeViewTransformer:
+    return BirdEyeViewTransformer(
+        BirdEyeViewConfig(
+            enabled=args.bev == "on",
+            src_top_y_ratio=args.bev_src_top_y,
+            src_bottom_y_ratio=args.bev_src_bottom_y,
+            src_top_width_ratio=args.bev_src_top_width,
+            src_bottom_width_ratio=args.bev_src_bottom_width,
+            dst_margin_x_ratio=args.bev_dst_margin_x,
+        )
+    )
+
+
+def apply_geometry_view(
+    frame: Any,
+    mask_result: Optional[YoloLaneMask],
+    bev: BirdEyeViewTransformer,
+) -> tuple:
+    if not bev.enabled:
+        return frame, mask_result
+
+    geometry_frame = bev.warp_frame(frame)
+    if mask_result is None:
+        return geometry_frame, None
+
+    geometry_mask = bev.warp_mask(mask_result.mask, frame.shape)
+    geometry_mask_result = YoloLaneMask(
+        mask=geometry_mask,
+        confidence=mask_result.confidence,
+        class_id=mask_result.class_id,
+        class_name=mask_result.class_name,
+        device=mask_result.device,
+        inference_ms=mask_result.inference_ms,
+    )
+    return geometry_frame, geometry_mask_result
 
 
 class DriveRecorder:
@@ -327,6 +394,7 @@ def draw_debug(
     command: ControlCommand,
     running: bool,
     fps: float,
+    view_name: str = "camera",
 ) -> Any:
     display = frame.copy()
     if mask_result is not None:
@@ -346,7 +414,7 @@ def draw_debug(
     mask_name = mask_result.class_name if mask_result else "none"
     lines = [
         status,
-        "mask=%s lane=%s conf=%.2f" % (mask_name, lane.reason, lane.confidence),
+        "view=%s mask=%s lane=%s conf=%.2f" % (view_name, mask_name, lane.reason, lane.confidence),
         "err=%.3f head=%.3f speed=%d steer=%d" % (
             lane.lateral_error_norm,
             lane.heading_error,
@@ -376,13 +444,15 @@ def log_status(
     running: bool,
     fps: float,
     device: str,
+    view_name: str = "camera",
 ) -> None:
     mask_name = mask_result.class_name if mask_result else "none"
     mask_conf = mask_result.confidence if mask_result else 0.0
     inference_ms = mask_result.inference_ms if mask_result else 0.0
     LOG.info(
-        "run=%s device=%s fps=%.1f infer=%.1fms mask=%s %.2f lane=%s err=%.3f head=%.3f speed=%d steer=%d",
+        "run=%s view=%s device=%s fps=%.1f infer=%.1fms mask=%s %.2f lane=%s err=%.3f head=%.3f speed=%d steer=%d",
         "on" if running else "off",
+        view_name,
         device,
         fps,
         inference_ms,
