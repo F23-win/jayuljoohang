@@ -60,6 +60,8 @@ def main() -> int:
             kp_heading=args.kp_heading,
             kd_heading=args.kd_heading,
             speed_curve_slowdown=args.speed_curve_slowdown,
+            lateral_priority_threshold=args.lateral_priority_threshold,
+            curve_strength_alpha=args.curve_strength_alpha,
             straight_steering_scale=args.straight_steering_scale,
             curve_steering_scale=args.curve_steering_scale,
             center_recovery_error_threshold=args.center_recovery_error_threshold,
@@ -67,6 +69,7 @@ def main() -> int:
             center_recovery_min_steering=args.center_recovery_min_steering,
             center_recovery_rate_limit=args.center_recovery_rate_limit,
             center_recovery_max_speed=args.center_recovery_max_speed,
+            lane_lost_hold_frames=args.lane_lost_hold_frames,
         )
     )
 
@@ -166,6 +169,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kp-heading", type=float, default=12.0)
     parser.add_argument("--kd-heading", type=float, default=4.0)
     parser.add_argument("--speed-curve-slowdown", type=int, default=70)
+    parser.add_argument(
+        "--lateral-priority-threshold",
+        type=float,
+        default=0.10,
+        help="ignore conflicting heading only when lateral error is above this threshold",
+    )
+    parser.add_argument(
+        "--curve-strength-alpha",
+        type=float,
+        default=0.35,
+        help="curve strength smoothing alpha; lower keeps curve state longer",
+    )
     parser.add_argument("--straight-steering-scale", type=float, default=0.45)
     parser.add_argument("--curve-steering-scale", type=float, default=1.45)
     parser.add_argument("--center-recovery-error-threshold", type=float, default=0.14)
@@ -173,6 +188,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--center-recovery-min-steering", type=int, default=85)
     parser.add_argument("--center-recovery-rate-limit", type=int, default=120)
     parser.add_argument("--center-recovery-max-speed", type=int, default=50)
+    parser.add_argument(
+        "--lane-lost-hold-frames",
+        type=int,
+        default=20,
+        help="keep the last steering/speed for up to this many frames when the lane is not detected",
+    )
     parser.add_argument("--lookahead", type=float, default=0.72)
     parser.add_argument("--sample-top", type=float, default=0.45)
     parser.add_argument("--sample-bottom", type=float, default=0.92)

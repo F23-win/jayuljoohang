@@ -67,6 +67,8 @@ def run(args: argparse.Namespace) -> int:
             kp_heading=args.kp_heading,
             kd_heading=args.kd_heading,
             speed_curve_slowdown=args.speed_curve_slowdown,
+            lateral_priority_threshold=args.lateral_priority_threshold,
+            curve_strength_alpha=args.curve_strength_alpha,
             straight_steering_scale=args.straight_steering_scale,
             curve_steering_scale=args.curve_steering_scale,
             center_recovery_error_threshold=args.center_recovery_error_threshold,
@@ -198,6 +200,18 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument("--kp-heading", type=float, default=12.0)
     parser.add_argument("--kd-heading", type=float, default=4.0)
     parser.add_argument("--speed-curve-slowdown", type=int, default=70)
+    parser.add_argument(
+        "--lateral-priority-threshold",
+        type=float,
+        default=0.10,
+        help="ignore conflicting heading only when lateral error is above this threshold",
+    )
+    parser.add_argument(
+        "--curve-strength-alpha",
+        type=float,
+        default=0.35,
+        help="curve strength smoothing alpha; lower keeps curve state longer",
+    )
     parser.add_argument("--straight-steering-scale", type=float, default=0.45)
     parser.add_argument("--curve-steering-scale", type=float, default=1.45)
     parser.add_argument("--center-recovery-error-threshold", type=float, default=0.14)

@@ -168,6 +168,27 @@ class YoloLaneGeometryTest(unittest.TestCase):
 
         self.assertGreater(command.steering, 0)
 
+    def test_higher_lateral_priority_threshold_allows_curve_heading(self):
+        follower = YoloLaneFollower(
+            YoloLaneFollowerConfig(
+                kp_lateral=100.0,
+                kd_lateral=0.0,
+                kp_heading=80.0,
+                kd_heading=0.0,
+                lateral_priority_threshold=0.25,
+                steering_rate_limit=500,
+                min_steering_rate_limit=500,
+                max_steering=500,
+                straight_steering_scale=1.0,
+                curve_steering_scale=1.0,
+            )
+        )
+        lane = lane_geometry(lateral_error_norm=0.12, heading_error=-1.0)
+
+        command = follower.plan(lane)
+
+        self.assertLess(command.steering, 0)
+
     def test_curve_strength_ramps_steering_response(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(
