@@ -37,10 +37,13 @@ class ParkingLidarTest(unittest.TestCase):
                 min_observed_points=5,
                 car_cluster_radius_mm=120.0,
                 car_cluster_min_points=3,
+                gap_cluster_min_points=3,
+                gap_pair_min_points=6,
                 expected_observed_gap_mm=1300.0,
                 observed_gap_min_mm=1100.0,
                 observed_gap_max_mm=1500.0,
                 gap_confirm_scans=2,
+                gap_center_y_back_min_mm=-100.0,
                 gap_center_smooth_alpha=1.0,
                 sensor_to_rear_axle_y_back_mm=0.0,
                 entry_tolerance_mm=50.0,
@@ -131,6 +134,260 @@ class ParkingLidarTest(unittest.TestCase):
         self.assertFalse(second.gap_found)
         self.assertAlmostEqual(second.first_car_slot_edge_y_back_mm, -640.0)
 
+    def test_non_right_side_clusters_do_not_trigger_first_car(self):
+        config = replace(
+            self.make_estimator().config,
+            min_observed_points=3,
+            first_car_confirm_scans=1,
+        )
+        estimator = LidarParkingSpaceEstimator(config)
+        points = tuple(
+            point_at(x, y)
+            for x, y in (
+                (-900.0, -640.0),
+                (-950.0, -620.0),
+                (-1000.0, -600.0),
+                (0.0, -1000.0),
+                (30.0, -980.0),
+            )
+        )
+
+        observation = estimator.estimate(LidarScan(1.0, points), now=1.0)
+
+        self.assertTrue(observation.valid)
+        self.assertEqual(observation.car_roi_points, 0)
+        self.assertEqual(observation.car_count, 0)
+        self.assertFalse(observation.first_car_seen)
+        self.assertFalse(observation.first_car_confirmed)
+        self.assertFalse(observation.first_car_turn_reached)
+        self.assertFalse(observation.gap_found)
+
+    def test_close_right_side_sparse_returns_trigger_first_car(self):
+        config = LidarParkingConfig(
+            angle_offset_deg=0.0,
+            clockwise_angles=False,
+            quality_min=1,
+            car_detection_roi=RectangleRoi(250.0, 2600.0, -2500.0, 2500.0),
+            min_observed_points=5,
+            car_cluster_radius_mm=350.0,
+            car_cluster_min_points=2,
+            first_car_min_x_right_mm=250.0,
+            first_car_confirm_scans=1,
+            first_car_turn_target_y_back_mm=-650.0,
+        )
+        estimator = LidarParkingSpaceEstimator(config)
+        scan = LidarScan(
+            1.0,
+            (
+                point_at(320.0, -640.0, quality=1),
+                point_at(360.0, -620.0, quality=1),
+            ),
+        )
+
+        observation = estimator.estimate(scan, now=1.0)
+
+        self.assertTrue(observation.valid)
+        self.assertEqual(observation.car_roi_points, 2)
+        self.assertEqual(observation.car_count, 1)
+        self.assertTrue(observation.first_car_seen)
+        self.assertTrue(observation.first_car_confirmed)
+        self.assertTrue(observation.first_car_turn_reached)
+
+    def test_weak_two_cluster_returns_do_not_confirm_slot_gap(self):
+        config = LidarParkingConfig(
+            angle_offset_deg=0.0,
+            clockwise_angles=False,
+            quality_min=1,
+            car_detection_roi=RectangleRoi(500.0, 1500.0, -1800.0, 1800.0),
+            min_observed_points=5,
+            car_cluster_radius_mm=120.0,
+            car_cluster_min_points=2,
+            gap_cluster_min_points=5,
+            gap_pair_min_points=12,
+            expected_observed_gap_mm=1300.0,
+            observed_gap_min_mm=1100.0,
+            observed_gap_max_mm=1500.0,
+            gap_confirm_scans=1,
+            gap_center_y_back_min_mm=-100.0,
+        )
+        estimator = LidarParkingSpaceEstimator(config)
+        weak_points = tuple(
+            point_at(x, y)
+            for x, y in (
+                (950.0, -720.0), (980.0, -705.0),
+                (1020.0, -695.0), (1050.0, -680.0),
+                (950.0, 620.0), (980.0, 635.0),
+                (1020.0, 645.0), (1050.0, 660.0),
+            )
+        )
+
+        observation = estimator.estimate(LidarScan(1.0, weak_points), now=1.0)
+
+        self.assertTrue(observation.valid)
+        self.assertEqual(observation.car_count, 2)
+        self.assertTrue(observation.second_car_seen)
+        self.assertFalse(observation.gap_found)
+        self.assertFalse(observation.gap_confirmed)
+        self.assertEqual(observation.reason, "two_cars_no_valid_gap")
+
+    def test_strong_two_cluster_returns_can_confirm_slot_gap(self):
+        config = LidarParkingConfig(
+            angle_offset_deg=0.0,
+            clockwise_angles=False,
+            quality_min=1,
+            car_detection_roi=RectangleRoi(500.0, 1500.0, -1800.0, 1800.0),
+            min_observed_points=5,
+            car_cluster_radius_mm=120.0,
+            car_cluster_min_points=2,
+            gap_cluster_min_points=5,
+            gap_pair_min_points=12,
+            expected_observed_gap_mm=1300.0,
+            observed_gap_min_mm=1100.0,
+            observed_gap_max_mm=1500.0,
+            gap_confirm_scans=1,
+            gap_center_y_back_min_mm=-100.0,
+            gap_center_smooth_alpha=1.0,
+        )
+        estimator = LidarParkingSpaceEstimator(config)
+        strong_points = tuple(
+            point_at(x, y)
+            for x, y in (
+                (940.0, -730.0), (965.0, -718.0), (990.0, -706.0),
+                (1015.0, -694.0), (1040.0, -682.0), (1065.0, -670.0),
+                (940.0, 610.0), (965.0, 622.0), (990.0, 634.0),
+                (1015.0, 646.0), (1040.0, 658.0), (1065.0, 670.0),
+            )
+        )
+
+        observation = estimator.estimate(LidarScan(1.0, strong_points), now=1.0)
+
+        self.assertTrue(observation.gap_found)
+        self.assertTrue(observation.gap_confirmed)
+        self.assertAlmostEqual(observation.gap_width_mm, 1300.0, delta=80.0)
+
+    def test_initial_slot_candidate_must_be_rearward_enough(self):
+        config = LidarParkingConfig(
+            angle_offset_deg=0.0,
+            clockwise_angles=False,
+            quality_min=1,
+            car_detection_roi=RectangleRoi(500.0, 1500.0, -1800.0, 1800.0),
+            min_observed_points=5,
+            car_cluster_radius_mm=120.0,
+            car_cluster_min_points=2,
+            gap_cluster_min_points=5,
+            gap_pair_min_points=10,
+            expected_observed_gap_mm=1300.0,
+            observed_gap_min_mm=1100.0,
+            observed_gap_max_mm=1500.0,
+            gap_center_y_back_min_mm=200.0,
+            gap_confirm_scans=1,
+            gap_center_smooth_alpha=1.0,
+        )
+        estimator = LidarParkingSpaceEstimator(config)
+        strong_points = tuple(
+            point_at(x, y)
+            for x, y in (
+                (940.0, -730.0), (965.0, -718.0), (990.0, -706.0),
+                (1015.0, -694.0), (1040.0, -682.0), (1065.0, -670.0),
+                (940.0, 610.0), (965.0, 622.0), (990.0, 634.0),
+                (1015.0, 646.0), (1040.0, 658.0), (1065.0, 670.0),
+            )
+        )
+
+        observation = estimator.estimate(LidarScan(1.0, strong_points), now=1.0)
+
+        self.assertEqual(observation.car_count, 2)
+        self.assertFalse(observation.gap_found)
+        self.assertFalse(observation.gap_confirmed)
+        self.assertEqual(observation.reason, "two_cars_no_valid_gap")
+
+    def test_interrupted_candidate_confirms_without_waiting_for_consecutive_scans(self):
+        config = LidarParkingConfig(
+            angle_offset_deg=0.0,
+            clockwise_angles=False,
+            quality_min=1,
+            car_detection_roi=RectangleRoi(500.0, 1500.0, -1800.0, 1800.0),
+            min_observed_points=5,
+            car_cluster_radius_mm=120.0,
+            car_cluster_min_points=2,
+            gap_cluster_min_points=5,
+            gap_pair_min_points=10,
+            expected_observed_gap_mm=1300.0,
+            observed_gap_min_mm=1100.0,
+            observed_gap_max_mm=1500.0,
+            gap_center_y_back_min_mm=200.0,
+            gap_confirm_scans=3,
+            gap_candidate_hold_s=1.2,
+            gap_center_smooth_alpha=1.0,
+        )
+        estimator = LidarParkingSpaceEstimator(config)
+
+        def shifted_two_car_points(offset):
+            return tuple(
+                point_at(x, y + offset)
+                for x, y in (
+                    (940.0, -730.0), (965.0, -718.0), (990.0, -706.0),
+                    (1015.0, -694.0), (1040.0, -682.0), (1065.0, -670.0),
+                    (940.0, 610.0), (965.0, 622.0), (990.0, 634.0),
+                    (1015.0, 646.0), (1040.0, 658.0), (1065.0, 670.0),
+                )
+            )
+
+        first = estimator.estimate(LidarScan(1.0, shifted_two_car_points(350.0)), now=1.0)
+        missed = estimator.estimate(
+            LidarScan(1.5, shifted_two_car_points(350.0)[:6]),
+            now=1.5,
+        )
+        second = estimator.estimate(LidarScan(2.0, shifted_two_car_points(400.0)), now=2.0)
+        third = estimator.estimate(LidarScan(2.8, shifted_two_car_points(450.0)), now=2.8)
+
+        self.assertTrue(first.gap_found)
+        self.assertFalse(first.gap_confirmed)
+        self.assertFalse(missed.gap_found)
+        self.assertTrue(second.gap_found)
+        self.assertFalse(second.gap_confirmed)
+        self.assertTrue(third.gap_confirmed)
+
+    def test_confirmed_slot_tracks_one_visible_border_cluster(self):
+        config = replace(
+            self.make_estimator().config,
+            gap_confirm_scans=1,
+            gap_single_cluster_track_enabled=True,
+            gap_single_cluster_max_edge_jump_mm=700.0,
+            slot_tracking_roi=RectangleRoi(-1800.0, 1800.0, -2500.0, 2500.0),
+            gap_center_smooth_alpha=1.0,
+            gap_orientation_smooth_alpha=1.0,
+        )
+        estimator = LidarParkingSpaceEstimator(config)
+        initial = estimator.estimate(
+            LidarScan(1.0, self.two_car_points(offset=350.0)),
+            now=1.0,
+        )
+        first_car_only = tuple(
+            point_at(x, y + 500.0)
+            for x, y in (
+                (390.0, -720.0),
+                (400.0, -700.0),
+                (410.0, -680.0),
+            )
+        )
+
+        tracked = estimator.estimate(LidarScan(2.0, first_car_only), now=2.0)
+
+        self.assertTrue(initial.gap_confirmed)
+        self.assertEqual(tracked.car_count, 1)
+        self.assertTrue(tracked.gap_confirmed)
+        self.assertFalse(tracked.coasted)
+        self.assertLess(
+            tracked.gap_center_x_right_mm,
+            initial.gap_center_x_right_mm - 500.0,
+        )
+        self.assertAlmostEqual(
+            tracked.gap_center_y_back_mm - initial.gap_center_y_back_mm,
+            150.0,
+            delta=1.0,
+        )
+
     def test_gap_center_produces_rear_axle_position_error(self):
         estimator = self.make_estimator()
         points = self.two_car_points(offset=250.0)
@@ -191,6 +448,8 @@ class ParkingLidarTest(unittest.TestCase):
             observed_gap_min_mm=1100.0,
             observed_gap_max_mm=1500.0,
             gap_center_x_min_mm=0.0,
+            gap_center_y_back_min_mm=-100.0,
+            gap_pair_min_points=10,
         )
 
         gap = choose_gap(clusters, config)

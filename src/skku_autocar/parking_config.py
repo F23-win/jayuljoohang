@@ -58,13 +58,18 @@ def load_parking_config(path: str) -> ParkingAppConfig:
     lidar_data = section(data, "lidar")
     car_roi = RectangleRoi(**section(lidar_data, "car_detection_roi"))
     safety_roi = RectangleRoi(**section(lidar_data, "safety_roi"))
+    tracking_roi_data = lidar_data.get("slot_tracking_roi")
     lidar_values = {
         key: value
         for key, value in lidar_data.items()
-        if key not in ("car_detection_roi", "safety_roi")
+        if key not in ("car_detection_roi", "safety_roi", "slot_tracking_roi")
     }
     lidar_values["car_detection_roi"] = car_roi
     lidar_values["safety_roi"] = safety_roi
+    if tracking_roi_data is not None:
+        if not isinstance(tracking_roi_data, dict):
+            raise ValueError("config section 'slot_tracking_roi' must be an object")
+        lidar_values["slot_tracking_roi"] = RectangleRoi(**tracking_roi_data)
 
     return ParkingAppConfig(
         rear_camera=CameraConfig(**section(data, "rear_camera")),

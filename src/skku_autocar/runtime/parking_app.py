@@ -29,7 +29,7 @@ from ..parking_config import ParkingAppConfig, load_parking_config
 from ..perception.bev import BevTransformer
 from ..perception.yolo_lane import YoloLaneConfig, YoloLaneSegmenter
 from ..planning.t_parking_planner import ParkingState, TParkingPlanner
-from ..sensors.lidar import LidarCsvReplay, RplidarScanner
+from ..sensors.lidar import LidarCsvReplay, RplidarScanner, find_lidar_port
 
 
 LOG = logging.getLogger("skku_autocar.parking")
@@ -188,10 +188,29 @@ def run_prepared(args: argparse.Namespace) -> int:
 
     lidar_replay = LidarCsvReplay(str(resolve_path(args.lidar_csv))) if args.lidar_csv else None
     lidar_scanner = None
-    lidar_port = args.lidar_port
+    lidar_port = None if lidar_replay is not None else find_lidar_port(args.lidar_port)
+    if (
+        args.lidar_port
+        and args.lidar_port.strip().lower() not in ("", "auto")
+        and lidar_port is not None
+        and lidar_port != args.lidar_port
+    ):
+        LOG.warning(
+            "requested LiDAR port %s is unavailable; using detected port %s",
+            args.lidar_port,
+            lidar_port,
+        )
+    if args.lidar_port and lidar_port is None:
+        raise RuntimeError(
+            "LiDAR serial port was not found for %s. Run "
+            "PYTHONPATH=src venv/bin/python scripts/list_serial_ports.py "
+            "and use the /dev/cu.usbserial-* port."
+            % args.lidar_port
+        )
     if lidar_port is not None:
         lidar_scanner = RplidarScanner(lidar_port)
         lidar_scanner.start()
+        LOG.info("lidar scanner started: %s", lidar_port)
     if config.runtime.require_lidar and lidar_replay is None and lidar_scanner is None and not args.allow_no_lidar:
         raise RuntimeError("LiDAR is required: pass --lidar-csv, --lidar-port, or explicitly --allow-no-lidar")
 
@@ -335,6 +354,8 @@ def run_prepared(args: argparse.Namespace) -> int:
                 lidar_estimator.vehicle_points(lidar_scan),
                 config,
                 lidar_observation,
+                geometry,
+                plan,
             )
             dashboard = draw_live_dashboard(
                 cv2,
@@ -437,6 +458,11 @@ def current_lidar_observation(
         return estimator.estimate(scan, now=scan.timestamp), scan
     if scanner is not None:
         scan = scanner.latest()
+        if scan is None and scanner.error is not None:
+            return LidarParkingObservation(
+                timestamp=time.time(),
+                reason="lidar_error:%s" % scanner.error,
+            ), None
         return estimator.estimate(scan, now=time.time()), scan
     if allow_no_lidar:
         target = estimator.config.sensor_to_rear_axle_y_back_mm
@@ -581,7 +607,10 @@ def draw_live_dashboard(
             plan.command.steering,
             plan.reason,
         ),
-        "LiDAR cars=%d gap=%s centerY=%s cm width=%s cm" % (
+        "LiDAR %s pts=%d/%d cars=%d gap=%s centerY=%s cm width=%s cm" % (
+            lidar.reason,
+            lidar.observed_points,
+            lidar.car_roi_points,
             lidar.car_count,
             "CONFIRMED" if lidar.gap_confirmed else (
                 "candidate" if lidar.gap_found else "no"
@@ -810,6 +839,8 @@ def draw_lidar_debug(
     points: list,
     config: ParkingAppConfig,
     observation: LidarParkingObservation,
+    geometry: ParkingGeometry,
+    plan: Any,
 ) -> Any:
     size = 600
     scale = 0.10  # 6 m across the full canvas.
@@ -824,6 +855,15 @@ def draw_lidar_debug(
         cv2, canvas, (0.0, -3000.0), (0.0, 3000.0),
         origin, scale, rotation_deg, (55, 55, 55), 1,
     )
+    draw_roi(
+        cv2, canvas, config.lidar.car_detection_roi,
+        origin, scale, rotation_deg, (120, 80, 0),
+    )
+    if observation.gap_confirmed and config.lidar.slot_tracking_roi is not None:
+        draw_roi(
+            cv2, canvas, config.lidar.slot_tracking_roi,
+            origin, scale, rotation_deg, (120, 0, 120),
+        )
     draw_roi(
         cv2, canvas, config.lidar.safety_roi,
         origin, scale, rotation_deg, (0, 0, 255),
@@ -934,6 +974,17 @@ def draw_lidar_debug(
             (0, 255, 0),
             -1,
         )
+    draw_reverse_path_on_lidar(
+        cv2,
+        np,
+        canvas,
+        config,
+        geometry,
+        getattr(plan, "path", None),
+        origin,
+        scale,
+        rotation_deg,
+    )
     draw_vehicle_outline(
         cv2,
         canvas,
@@ -1001,7 +1052,7 @@ def draw_lidar_debug(
     )
     cv2.putText(
         canvas,
-        "yellow=first-car trigger | orange=slot | green=center | cyan=axle | blue=cars",
+        "brown=initial ROI | violet=tracking ROI | cyan=reverse path | orange=slot | blue=cars",
         (12, size - 15),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.52,
@@ -1159,6 +1210,116 @@ def draw_world_segment(
         thickness,
         cv2.LINE_AA,
     )
+
+
+def draw_world_polyline(
+    cv2: Any,
+    np: Any,
+    image: Any,
+    points: Tuple[Tuple[float, float], ...],
+    origin: Tuple[int, int],
+    scale: float,
+    rotation_deg: float,
+    color: Tuple[int, int, int],
+    thickness: int,
+) -> None:
+    if len(points) < 2:
+        return
+    pixels = np.asarray(
+        [
+            world_to_lidar_pixel(point[0], point[1], origin, scale, rotation_deg)
+            for point in points
+        ],
+        dtype=np.int32,
+    ).reshape((-1, 1, 2))
+    cv2.polylines(image, [pixels], False, color, thickness, cv2.LINE_AA)
+
+
+def draw_reverse_path_on_lidar(
+    cv2: Any,
+    np: Any,
+    image: Any,
+    config: ParkingAppConfig,
+    geometry: ParkingGeometry,
+    path: Any,
+    origin: Tuple[int, int],
+    scale: float,
+    rotation_deg: float,
+) -> None:
+    world_points = reverse_path_points_to_lidar_world(config, geometry, path)
+    if not world_points:
+        return
+    draw_world_polyline(
+        cv2,
+        np,
+        image,
+        world_points,
+        origin,
+        scale,
+        rotation_deg,
+        (255, 255, 0),
+        3,
+    )
+    target = world_points[-1]
+    cv2.circle(
+        image,
+        world_to_lidar_pixel(target[0], target[1], origin, scale, rotation_deg),
+        6,
+        (255, 255, 255),
+        2,
+    )
+    if path.lookahead_point is not None:
+        lookahead = reverse_path_point_to_lidar_world(
+            config,
+            geometry,
+            path.lookahead_point,
+        )
+        if lookahead is not None:
+            cv2.circle(
+                image,
+                world_to_lidar_pixel(
+                    lookahead[0], lookahead[1], origin, scale, rotation_deg
+                ),
+                5,
+                (0, 255, 255),
+                -1,
+            )
+
+
+def reverse_path_points_to_lidar_world(
+    config: ParkingAppConfig,
+    geometry: ParkingGeometry,
+    path: Any,
+) -> Tuple[Tuple[float, float], ...]:
+    if path is None or not path.points:
+        return ()
+    result = []
+    for point in path.points:
+        world = reverse_path_point_to_lidar_world(config, geometry, point)
+        if world is not None:
+            result.append(world)
+    return tuple(result)
+
+
+def reverse_path_point_to_lidar_world(
+    config: ParkingAppConfig,
+    geometry: ParkingGeometry,
+    point: Tuple[float, float],
+) -> Optional[Tuple[float, float]]:
+    if config.lidar.parking_space_width_mm <= 0.0:
+        return None
+    pixels_per_mm = (
+        config.geometry.expected_slot_width_px
+        / config.lidar.parking_space_width_mm
+    )
+    if pixels_per_mm <= 0.0:
+        return None
+    x_right = (point[0] - geometry.vehicle_x_px) / pixels_per_mm
+    y_back = (
+        config.lidar.sensor_to_rear_axle_y_back_mm
+        + (geometry.vehicle_y_px - point[1]) / pixels_per_mm
+    )
+    return x_right, y_back
 
 
 def draw_world_polygon(
