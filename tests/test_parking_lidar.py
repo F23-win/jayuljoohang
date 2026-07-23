@@ -11,6 +11,8 @@ from skku_autocar.estimation.parking_lidar import (
     RectangleRoi,
     infer_dynamic_slot_polygon,
     choose_gap,
+    is_gap_cluster_eligible,
+    summarize_cluster,
 )
 from skku_autocar.sensors.lidar import (
     LidarCsvReplay,
@@ -265,6 +267,42 @@ class ParkingLidarTest(unittest.TestCase):
         self.assertTrue(observation.gap_found)
         self.assertTrue(observation.gap_confirmed)
         self.assertAlmostEqual(observation.gap_width_mm, 1300.0, delta=80.0)
+
+    def test_human_like_blob_is_excluded_from_gap_pairing(self):
+        config = LidarParkingConfig(
+            car_cluster_min_points=2,
+            gap_cluster_min_points=5,
+            gap_pair_min_points=10,
+            gap_cluster_min_linearity=0.55,
+            expected_observed_gap_mm=1300.0,
+            observed_gap_min_mm=1100.0,
+            observed_gap_max_mm=1500.0,
+            gap_center_x_min_mm=0.0,
+            gap_center_y_back_min_mm=-100.0,
+        )
+        parked_car = summarize_cluster((
+            (900.0, -700.0),
+            (925.0, -690.0),
+            (950.0, -680.0),
+            (975.0, -670.0),
+            (1000.0, -660.0),
+        ))
+        human_like_blob = summarize_cluster((
+            (910.0, 540.0),
+            (970.0, 520.0),
+            (1030.0, 540.0),
+            (1050.0, 600.0),
+            (1030.0, 660.0),
+            (970.0, 680.0),
+            (910.0, 660.0),
+            (890.0, 600.0),
+        ))
+
+        self.assertGreater(parked_car.surface_linearity, 0.9)
+        self.assertLess(human_like_blob.surface_linearity, 0.1)
+        self.assertTrue(is_gap_cluster_eligible(parked_car, config))
+        self.assertFalse(is_gap_cluster_eligible(human_like_blob, config))
+        self.assertIsNone(choose_gap((parked_car, human_like_blob), config))
 
     def test_initial_slot_candidate_must_be_rearward_enough(self):
         config = LidarParkingConfig(

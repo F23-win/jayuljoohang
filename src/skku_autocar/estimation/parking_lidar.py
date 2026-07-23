@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import cos, hypot, radians, sin
+from math import cos, hypot, radians, sin, sqrt
 from typing import List, Optional, Sequence, Tuple
 
 from ..sensors.lidar import LidarPoint, LidarScan
@@ -35,6 +35,10 @@ class CarCluster:
     x_max_mm: float
     y_back_min_mm: float
     y_back_max_mm: float
+    # PCA-based surface score: 1.0 is a straight vehicle panel and 0.0 is an
+    # isotropic blob such as a leg/body return.  The default preserves callers
+    # that construct synthetic clusters without their original scan points.
+    surface_linearity: float = 1.0
 
     @property
     def center_y_back_mm(self) -> float:
@@ -76,6 +80,10 @@ class LidarParkingConfig:
     # false slot.
     gap_cluster_min_points: int = 5
     gap_pair_min_points: int = 10
+    # A parked-car return normally forms a short line segment at the visible
+    # body panel.  Reject round/scattered clusters (commonly people/legs) from
+    # gap pairing without weakening their use as ordinary obstacle returns.
+    gap_cluster_min_linearity: float = 0.0
 
     # Official painted bay dimensions. The observed surface gap is larger
     # because LiDAR sees the neighboring vehicles, not the painted boundaries.
@@ -713,7 +721,11 @@ def is_gap_cluster_eligible(
     config: LidarParkingConfig,
 ) -> bool:
     min_points = max(1, config.car_cluster_min_points, config.gap_cluster_min_points)
-    return cluster.point_count >= min_points
+    min_linearity = min(1.0, max(0.0, config.gap_cluster_min_linearity))
+    return (
+        cluster.point_count >= min_points
+        and cluster.surface_linearity >= min_linearity
+    )
 
 
 def cluster_slot_edge(
@@ -954,12 +966,33 @@ def infer_dynamic_slot_polygon(
 def summarize_cluster(points: Sequence[Tuple[float, float]]) -> CarCluster:
     xs = [point[0] for point in points]
     ys = [point[1] for point in points]
+    center_x = sum(xs) / len(xs)
+    center_y = sum(ys) / len(ys)
+    covariance_xx = sum((x - center_x) ** 2 for x in xs) / len(xs)
+    covariance_yy = sum((y - center_y) ** 2 for y in ys) / len(ys)
+    covariance_xy = sum(
+        (x - center_x) * (y - center_y)
+        for x, y in zip(xs, ys)
+    ) / len(xs)
+    covariance_trace = covariance_xx + covariance_yy
+    if covariance_trace <= 1e-9:
+        surface_linearity = 0.0
+    else:
+        eigenvalue_delta = sqrt(
+            max(
+                0.0,
+                (covariance_xx - covariance_yy) ** 2
+                + 4.0 * covariance_xy ** 2,
+            )
+        )
+        surface_linearity = eigenvalue_delta / covariance_trace
     return CarCluster(
         point_count=len(points),
         x_min_mm=min(xs),
         x_max_mm=max(xs),
         y_back_min_mm=min(ys),
         y_back_max_mm=max(ys),
+        surface_linearity=surface_linearity,
     )
 
 
