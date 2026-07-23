@@ -24,15 +24,30 @@ class ParkingYoloConfig:
 
 @dataclass(frozen=True)
 class ParkingRuntimeConfig:
+    camera_enabled: bool = False
     command_rate_hz: float = 20.0
     lidar_video_offset_s: float = 0.0
     require_lidar: bool = True
     debug_window: bool = True
     lidar_display_rotation_deg: float = 0.0
-    lidar_debug_vehicle_width_mm: float = 550.0
+    # Legacy ``lidar_debug_*`` names are retained for config compatibility, but
+    # these dimensions now drive both visualization and full-inside control.
+    lidar_debug_vehicle_width_mm: float = 600.0
     lidar_debug_vehicle_length_mm: float = 1000.0
     # Positive distance means the LiDAR origin is behind the rear bumper.
     lidar_debug_sensor_behind_vehicle_rear_mm: float = 100.0
+    lidar_debug_rear_axle_to_rear_bumper_mm: float = 200.0
+    locked_slot_tracking_enabled: bool = True
+    locked_slot_min_points: int = 8
+    locked_slot_max_points: int = 180
+    locked_slot_min_range_mm: float = 200.0
+    locked_slot_max_range_mm: float = 3500.0
+    locked_slot_max_correspondence_mm: float = 320.0
+    locked_slot_trim_ratio: float = 0.65
+    locked_slot_iterations: int = 6
+    locked_slot_max_translation_per_scan_mm: float = 300.0
+    locked_slot_max_rotation_per_scan_deg: float = 15.0
+    locked_slot_max_hold_scans: int = 3
 
 
 @dataclass(frozen=True)

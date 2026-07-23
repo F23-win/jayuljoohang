@@ -137,6 +137,7 @@ class LidarParkingObservation:
     second_car_seen: bool = False
     gap_found: bool = False
     gap_confirmed: bool = False
+    gap_pair_observed: bool = False
     gap_width_mm: Optional[float] = None
     gap_near_edge_x_right_mm: Optional[float] = None
     gap_near_edge_y_back_mm: Optional[float] = None
@@ -278,6 +279,7 @@ class LidarParkingSpaceEstimator:
             # cluster pair or a 90/180-degree pose jump. Retain the previous
             # pose briefly and wait for a consistent observation.
             candidate = None
+        gap_pair_observed = candidate is not None
         if candidate is None and valid and self._confirmed:
             candidate = self._track_gap_from_single_cluster(clusters)
         new_scan = self._last_timestamp != scan.timestamp
@@ -390,6 +392,7 @@ class LidarParkingSpaceEstimator:
             second_car_seen=len(clusters) >= 2,
             gap_found=gap_found,
             gap_confirmed=self._confirmed and gap_found,
+            gap_pair_observed=gap_pair_observed,
             gap_width_mm=gap_width,
             gap_near_edge_x_right_mm=near_edge_x,
             gap_near_edge_y_back_mm=near_edge,
@@ -870,6 +873,7 @@ def choose_gap(
 def infer_dynamic_slot_polygon(
     observation: LidarParkingObservation,
     depth_mm: float,
+    width_mm: Optional[float] = None,
 ) -> Optional[Tuple[Tuple[float, float], ...]]:
     """Infer a moving parking-space rectangle from the two bordering cars.
 
@@ -889,25 +893,40 @@ def infer_dynamic_slot_polygon(
     ):
         return None
 
-    first_edge = (
+    detected_first_edge = (
         observation.gap_near_edge_x_right_mm,
         observation.gap_near_edge_y_back_mm,
     )
-    second_edge = (
+    detected_second_edge = (
         observation.gap_far_edge_x_right_mm,
         observation.gap_far_edge_y_back_mm,
     )
-    axis_x = second_edge[0] - first_edge[0]
-    axis_y = second_edge[1] - first_edge[1]
+    axis_x = detected_second_edge[0] - detected_first_edge[0]
+    axis_y = detected_second_edge[1] - detected_first_edge[1]
     axis_length = hypot(axis_x, axis_y)
     if axis_length <= 1e-6:
         return None
 
+    axis_x /= axis_length
+    axis_y /= axis_length
+    center_x = (detected_first_edge[0] + detected_second_edge[0]) / 2.0
+    center_y = (detected_first_edge[1] + detected_second_edge[1]) / 2.0
+    locked_width = axis_length if width_mm is None else max(0.0, width_mm)
+    half_width = locked_width / 2.0
+    first_edge = (
+        center_x - axis_x * half_width,
+        center_y - axis_y * half_width,
+    )
+    second_edge = (
+        center_x + axis_x * half_width,
+        center_y + axis_y * half_width,
+    )
+
     # Use the depth direction locked by the tracker. Only the sign of the
     # perpendicular is selected here, so the rectangle remains orthogonal while
     # never flipping 180 degrees as the LiDAR crosses the entrance line.
-    normal_x = -axis_y / axis_length
-    normal_y = axis_x / axis_length
+    normal_x = -axis_y
+    normal_y = axis_x
     if (
         observation.slot_depth_x_right is not None
         and observation.slot_depth_y_back is not None
@@ -918,8 +937,6 @@ def infer_dynamic_slot_polygon(
             < 0.0
         )
     else:
-        center_x = (first_edge[0] + second_edge[0]) / 2.0
-        center_y = (first_edge[1] + second_edge[1]) / 2.0
         flip_normal = center_x * normal_x + center_y * normal_y < 0.0
     if flip_normal:
         normal_x = -normal_x

@@ -15,6 +15,7 @@ class SerialVehicleConfig:
     port: Optional[str] = None
     baudrate: int = 115200
     timeout_s: float = 0.1
+    startup_delay_s: float = 0.0
     ready_timeout_s: float = 3.0
 
 
@@ -129,6 +130,10 @@ class SerialVehicleClient:
         self._serial = serial.Serial(port, self.config.baudrate, timeout=self.config.timeout_s)
         self.port = port
         try:
+            if self.config.startup_delay_s > 0:
+                # Opening an Arduino Mega serial port can reset the board.
+                # Wait for its bootloader and setup() to finish before PING.
+                time.sleep(self.config.startup_delay_s)
             self._wait_ready()
         except Exception:
             self.close()
@@ -176,8 +181,16 @@ class SerialVehicleClient:
     def _wait_ready(self) -> None:
         serial_conn = self._require_open()
         deadline = time.monotonic() + self.config.ready_timeout_s
+        next_ping_at = 0.0
         ready_lines = []
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_ping_at:
+                # Opening an Arduino commonly resets it and emits READY, but
+                # some USB adapters do not reset. PING also verifies an already
+                # running compatible controller without any firmware change.
+                serial_conn.write(b"PING\n")
+                next_ping_at = now + 0.25
             raw = serial_conn.readline()
             if not raw:
                 continue

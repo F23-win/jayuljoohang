@@ -103,8 +103,14 @@ def find_lidar_port(
         if explicit_port is None or explicit_port.strip().lower() in ("", "auto")
         else explicit_port
     )
-    if requested is not None and exists(requested):
-        return requested
+    if requested is not None:
+        # Windows serial endpoints such as COM7 are valid device names but are
+        # not filesystem paths, so Path("COM7").exists() is normally false.
+        upper = requested.upper()
+        if exists(requested) or (
+            upper.startswith("COM") and upper[3:].isdigit()
+        ):
+            return requested
 
     if ports is None:
         try:

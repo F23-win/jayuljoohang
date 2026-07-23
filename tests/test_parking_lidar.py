@@ -103,6 +103,7 @@ class ParkingLidarTest(unittest.TestCase):
         self.assertFalse(first.gap_confirmed)
         self.assertFalse(repeated.gap_confirmed)
         self.assertTrue(second.gap_confirmed)
+        self.assertTrue(second.gap_pair_observed)
         self.assertAlmostEqual(second.gap_width_mm, 1300.0, delta=50.0)
         self.assertTrue(second.entry_reached)
 
@@ -377,6 +378,7 @@ class ParkingLidarTest(unittest.TestCase):
         self.assertTrue(initial.gap_confirmed)
         self.assertEqual(tracked.car_count, 1)
         self.assertTrue(tracked.gap_confirmed)
+        self.assertFalse(tracked.gap_pair_observed)
         self.assertFalse(tracked.coasted)
         self.assertLess(
             tracked.gap_center_x_right_mm,
@@ -563,6 +565,31 @@ class ParkingLidarTest(unittest.TestCase):
             infer_dynamic_slot_polygon(held, 1500.0),
             infer_dynamic_slot_polygon(initial, 1500.0),
         )
+
+    def test_official_width_override_keeps_detected_center_and_exact_size(self):
+        estimator = self.make_estimator()
+        observation = estimator.estimate(
+            LidarScan(1.0, self.two_car_points()),
+            now=1.0,
+        )
+
+        polygon = infer_dynamic_slot_polygon(
+            observation,
+            depth_mm=1500.0,
+            width_mm=950.0,
+        )
+
+        self.assertIsNotNone(polygon)
+        width = math.hypot(
+            polygon[1][0] - polygon[0][0],
+            polygon[1][1] - polygon[0][1],
+        )
+        depth = math.hypot(
+            polygon[3][0] - polygon[0][0],
+            polygon[3][1] - polygon[0][1],
+        )
+        self.assertAlmostEqual(width, 950.0, delta=0.01)
+        self.assertAlmostEqual(depth, 1500.0, delta=0.01)
 
     def test_safety_envelope_is_independent_of_gap_detection(self):
         estimator = self.make_estimator()

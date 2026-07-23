@@ -48,6 +48,15 @@ class LidarPortDetectionTest(unittest.TestCase):
 
         self.assertEqual(detected, handle.name)
 
+    def test_windows_com_port_is_kept_without_filesystem_entry(self):
+        detected = find_lidar_port(
+            "COM7",
+            ports=(port("COM9", "USB Serial"),),
+            exists=lambda _: False,
+        )
+
+        self.assertEqual(detected, "COM7")
+
 
 if __name__ == "__main__":
     unittest.main()

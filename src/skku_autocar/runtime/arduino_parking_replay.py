@@ -12,7 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from ..estimation.lidar_slot_geometry import LidarSlotGeometryProjector
+from ..estimation.locked_slot import LockedSlotPose
 from ..estimation.parking_geometry import ParkingGeometry, ParkingGeometryEstimator
 from ..estimation.parking_lidar import (
     LidarParkingObservation,
@@ -24,11 +24,13 @@ from ..perception.yolo_lane import YoloLaneConfig, YoloLaneSegmenter
 from ..planning.t_parking_planner import ParkingPlan, ParkingState, TParkingPlanner
 from ..sensors.lidar import LidarScan, load_lidar_csv
 from .parking_app import (
+    LOCKED_SLOT_STATES,
     compose_parking_dashboard,
     draw_lidar_debug,
     draw_parking_line,
     draw_reverse_path,
     extract_recording_zip,
+    make_locked_slot_geometry,
     parking_mask_color,
 )
 
@@ -406,6 +408,8 @@ class SharedParkingPlannerReplay:
         elapsed_s: float,
         left_ultrasonic_cm: Optional[float] = None,
         right_ultrasonic_cm: Optional[float] = None,
+        front_left_ultrasonic_cm: Optional[float] = None,
+        front_right_ultrasonic_cm: Optional[float] = None,
     ) -> ReplayCommand:
         plan = self.planner.update(
             geometry,
@@ -421,6 +425,16 @@ class SharedParkingPlannerReplay:
                 None
                 if right_ultrasonic_cm is None
                 else right_ultrasonic_cm * 10.0
+            ),
+            front_left_ultrasonic_mm=(
+                None
+                if front_left_ultrasonic_cm is None
+                else front_left_ultrasonic_cm * 10.0
+            ),
+            front_right_ultrasonic_mm=(
+                None
+                if front_right_ultrasonic_cm is None
+                else front_right_ultrasonic_cm * 10.0
             ),
         )
         self.last_plan = plan
@@ -468,6 +482,8 @@ def replay_state_for_planner(state: ParkingState) -> ReplayParkingState:
 
 def run_replay(args: argparse.Namespace) -> Dict[str, object]:
     config = load_parking_config(str(resolve_path(args.config)))
+    if args.no_camera is None:
+        args.no_camera = not config.runtime.camera_enabled
     config = replace(
         config,
         lidar=replace(
@@ -613,12 +629,7 @@ def simulate_scans(
     constants: ArduinoReplayConstants,
 ) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
     lidar_estimator = LidarParkingSpaceEstimator(config.lidar)
-    slot_geometry_projector = LidarSlotGeometryProjector(
-        config.lidar,
-        config.geometry,
-        config.bev.out_width,
-        config.bev.out_height,
-    )
+    locked_slot_geometry = make_locked_slot_geometry(config)
     controller = SharedParkingPlannerReplay(config)
     start = scans[0].timestamp
     rows: List[Dict[str, object]] = []
@@ -674,7 +685,11 @@ def simulate_scans(
             minimum_rear_cm = rear_cm if minimum_rear_cm is None else min(minimum_rear_cm, rear_cm)
         camera = latest_camera_sample(camera_samples, elapsed)
         line_error = camera.line_error_px if camera is not None and camera.found else None
-        geometry = slot_geometry_projector.project(lidar)
+        geometry = locked_slot_geometry.update(
+            lidar,
+            lidar_estimator.vehicle_points(scan),
+            lock_requested=controller.planner_state in LOCKED_SLOT_STATES,
+        )
         command = controller.update(lidar, geometry, elapsed)
         if command.state != previous_state:
             transitions.append(
@@ -800,12 +815,7 @@ def run_visual_replay(
     transformer = BevTransformer(config.bev)
     geometry_estimator = ParkingGeometryEstimator(config.geometry)
     lidar_estimator = LidarParkingSpaceEstimator(config.lidar)
-    slot_geometry_projector = LidarSlotGeometryProjector(
-        config.lidar,
-        config.geometry,
-        config.bev.out_width,
-        config.bev.out_height,
-    )
+    locked_slot_geometry = make_locked_slot_geometry(config)
     controller = SharedParkingPlannerReplay(config)
 
     capture = cv2.VideoCapture(str(video_path))
@@ -896,7 +906,13 @@ def run_visual_replay(
                     current_scan,
                     now=current_scan.timestamp,
                 )
-                geometry = slot_geometry_projector.project(current_lidar)
+                geometry = locked_slot_geometry.update(
+                    current_lidar,
+                    lidar_estimator.vehicle_points(current_scan),
+                    lock_requested=(
+                        controller.planner_state in LOCKED_SLOT_STATES
+                    ),
+                )
                 current_rear_cm = rear_lidar_distance_cm(current_scan, config)
                 old_state = controller.state
                 current_command = controller.update(
@@ -990,6 +1006,7 @@ def run_visual_replay(
                 elapsed,
                 constants,
                 controller,
+                locked_slot_geometry.pose,
             )
 
             if save_path is not None:
@@ -1162,6 +1179,7 @@ def draw_arduino_dashboard(
     elapsed_s: float,
     constants: ArduinoReplayConstants,
     controller: SharedParkingPlannerReplay,
+    locked_slot_pose: LockedSlotPose,
 ) -> object:
     rear_display = frame.copy()
     mask_geometry = (
@@ -1217,6 +1235,10 @@ def draw_arduino_dashboard(
         list(lidar_points),
         config,
         lidar,
+        geometry,
+        controller.last_plan,
+        slot_polygon=locked_slot_pose.polygon,
+        slot_status=locked_slot_pose.reason,
     )
 
     center_cm = (
@@ -1431,7 +1453,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--imgsz", type=int, default=512)
     parser.add_argument("--conf", type=float, default=None)
     parser.add_argument("--camera-interval-s", type=float, default=0.5)
-    parser.add_argument("--no-camera", action="store_true", help="run a fast LiDAR/state-only replay")
+    camera_group = parser.add_mutually_exclusive_group()
+    camera_group.add_argument(
+        "--camera",
+        dest="no_camera",
+        action="store_false",
+        help="enable optional YOLO camera diagnostics",
+    )
+    camera_group.add_argument(
+        "--no-camera",
+        dest="no_camera",
+        action="store_true",
+        help="run a fast LiDAR/state-only replay",
+    )
+    parser.set_defaults(no_camera=None)
     parser.add_argument("--position-tolerance-cm", type=float, default=10.0)
     parser.add_argument(
         "--first-car-turn-target-cm",
