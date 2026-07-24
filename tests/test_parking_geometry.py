@@ -3,9 +3,11 @@ import unittest
 import numpy as np
 
 from skku_autocar.estimation.parking_geometry import (
+    ParkingGeometry,
     ParkingGeometryConfig,
     ParkingGeometryEstimator,
     axial_angle_difference,
+    merge_camera_back_line,
 )
 
 
@@ -75,6 +77,44 @@ class ParkingGeometryTest(unittest.TestCase):
 
     def test_axial_angle_wraps_at_180_degrees(self):
         self.assertAlmostEqual(axial_angle_difference(2.0, 178.0), 4.0)
+
+    def test_merge_camera_back_line_overrides_lidar_depth_only(self):
+        camera_geometry = self.make_estimator().estimate(parking_masks(), confidence=1.0)
+        lidar_geometry = ParkingGeometry(
+            found=True,
+            has_side_pair=True,
+            has_back_line=False,
+            heading_error_deg=5.0,
+            lateral_error_norm=0.1,
+            confidence=0.9,
+            depth_remaining_px=9999.0,
+            reason="lidar_slot_box",
+        )
+
+        merged = merge_camera_back_line(lidar_geometry, camera_geometry)
+
+        self.assertTrue(merged.has_back_line)
+        self.assertEqual(merged.back, camera_geometry.back)
+        self.assertEqual(merged.depth_remaining_px, camera_geometry.depth_remaining_px)
+        # Everything else stays the LiDAR pipeline's own estimate.
+        self.assertEqual(merged.heading_error_deg, 5.0)
+        self.assertEqual(merged.lateral_error_norm, 0.1)
+        self.assertEqual(merged.confidence, 0.9)
+        self.assertEqual(merged.reason, "lidar_slot_box")
+
+    def test_merge_camera_back_line_is_noop_without_camera_back_line(self):
+        camera_geometry = self.make_estimator().estimate(parking_masks()[:2], confidence=1.0)
+        lidar_geometry = ParkingGeometry(
+            found=True,
+            has_side_pair=True,
+            has_back_line=False,
+            depth_remaining_px=None,
+            reason="lidar_slot_box",
+        )
+
+        merged = merge_camera_back_line(lidar_geometry, camera_geometry)
+
+        self.assertEqual(merged, lidar_geometry)
 
 
 if __name__ == "__main__":

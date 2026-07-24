@@ -173,6 +173,35 @@ def _score_lidar_port(port: Any) -> int:
     return score
 
 
+class LidarCsvRecorder:
+    """Append live scans in the timestamp/quality/angle/distance format load_lidar_csv expects."""
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._handle)
+        self._writer.writerow(("timestamp", "quality", "angle_deg", "distance_mm"))
+        self._last_timestamp: Optional[float] = None
+        self.scans_written = 0
+
+    def write_scan(self, scan: LidarScan) -> None:
+        if scan.timestamp == self._last_timestamp:
+            # RplidarScanner.latest() is polled faster than the sensor spins;
+            # skip repeats so replay isn't padded with duplicate scans.
+            return
+        for point in scan.points:
+            self._writer.writerow(
+                (scan.timestamp, point.quality, point.angle_deg, point.distance_mm)
+            )
+        self._last_timestamp = scan.timestamp
+        self.scans_written += 1
+        self._handle.flush()
+
+    def close(self) -> None:
+        self._handle.close()
+
+
 class LidarCsvReplay:
     """Select the nearest recorded scan using time relative to CSV start."""
 
@@ -197,6 +226,34 @@ class LidarCsvReplay:
         if elapsed_s - before <= after - elapsed_s:
             return self.scans[index - 1]
         return self.scans[index]
+
+
+def wait_for_scanner_ready(
+    latest: Callable[[], Optional[LidarScan]],
+    error: Callable[[], Optional[Exception]],
+    timeout_s: float,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> None:
+    """Block until a scanner produces its first scan or fails, whichever first.
+
+    ``RplidarScanner.start()`` only spawns a background thread; a bad port
+    fails asynchronously inside it, so without this a doomed run would sail
+    past the ``require_lidar`` startup gate and record for its full duration
+    with every frame silently stuck on ``lidar_error``.
+    """
+
+    deadline = now() + max(0.0, timeout_s)
+    while now() < deadline:
+        if latest() is not None:
+            return
+        current_error = error()
+        if current_error is not None:
+            raise RuntimeError("LiDAR connection failed: %s" % current_error)
+        sleep(0.05)
+    raise RuntimeError(
+        "LiDAR did not produce a scan within %.1fs" % timeout_s
+    )
 
 
 class RplidarScanner:
@@ -227,6 +284,9 @@ class RplidarScanner:
     def error(self) -> Optional[Exception]:
         with self._lock:
             return self._error
+
+    def wait_ready(self, timeout_s: float = 5.0) -> None:
+        wait_for_scanner_ready(self.latest, lambda: self.error, timeout_s)
 
     def close(self) -> None:
         self._stop_event.set()

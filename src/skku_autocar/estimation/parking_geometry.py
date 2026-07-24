@@ -492,6 +492,34 @@ class ParkingGeometryEstimator:
         return False
 
 
+def merge_camera_back_line(
+    geometry: ParkingGeometry,
+    camera_geometry: ParkingGeometry,
+) -> ParkingGeometry:
+    """Prefer the camera-detected painted back line over the LiDAR-inferred one.
+
+    LiDAR gets no return off painted lines, so its back edge is only a
+    geometric guess (fixed depth from the two bordering cars). The camera/YOLO
+    line detector sees the actual paint. Both pipelines share the same BEV
+    pixel frame and ``vehicle_reference_y_ratio`` convention, so the camera's
+    depth values are directly usable in place of the LiDAR ones.
+    """
+
+    if not camera_geometry.has_back_line:
+        return geometry
+    return replace(
+        geometry,
+        has_back_line=True,
+        back=camera_geometry.back,
+        depth_to_back_px=camera_geometry.depth_to_back_px,
+        depth_remaining_px=camera_geometry.depth_remaining_px,
+        back_center_x_px=camera_geometry.back_center_x_px,
+        back_center_y_px=camera_geometry.back_center_y_px,
+        stop_target_x_px=camera_geometry.stop_target_x_px,
+        stop_target_y_px=camera_geometry.stop_target_y_px,
+    )
+
+
 def axial_angle_difference(first_deg: float, second_deg: float) -> float:
     difference = abs((first_deg - second_deg) % 180.0)
     return min(difference, 180.0 - difference)

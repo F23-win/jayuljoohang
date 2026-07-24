@@ -15,6 +15,7 @@ from skku_autocar.estimation.parking_lidar import (
     summarize_cluster,
 )
 from skku_autocar.sensors.lidar import (
+    LidarCsvRecorder,
     LidarCsvReplay,
     LidarPoint,
     LidarScan,
@@ -655,6 +656,28 @@ class ParkingLidarTest(unittest.TestCase):
         self.assertEqual(len(scans), 2)
         self.assertEqual(len(scans[0].points), 2)
         self.assertEqual(replay.scan_at_elapsed(0.09).timestamp, 10.1)
+
+    def test_recorder_writes_csv_that_replay_can_load(self):
+        scans = (
+            LidarScan(10.0, (LidarPoint(15, 0.0, 1000.0), LidarPoint(8, 1.0, 1100.0))),
+            LidarScan(10.0, (LidarPoint(15, 0.0, 1000.0), LidarPoint(8, 1.0, 1100.0))),
+            LidarScan(10.1, (LidarPoint(15, 2.0, 1200.0),)),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lidar.csv"
+            recorder = LidarCsvRecorder(str(path))
+            for scan in scans:
+                recorder.write_scan(scan)
+            recorder.close()
+
+            self.assertEqual(recorder.scans_written, 2)
+            loaded = load_lidar_csv(str(path))
+
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(loaded[0].timestamp, 10.0)
+        self.assertEqual(len(loaded[0].points), 2)
+        self.assertEqual(loaded[1].timestamp, 10.1)
+        self.assertEqual(loaded[1].points[0].distance_mm, 1200.0)
 
 
 if __name__ == "__main__":

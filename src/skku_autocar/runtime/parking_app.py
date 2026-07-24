@@ -25,7 +25,11 @@ from ..estimation.locked_slot import (
     LockedSlotTrackerConfig,
 )
 from ..estimation.lidar_slot_geometry import LidarSlotGeometryProjector
-from ..estimation.parking_geometry import ParkingGeometry, ParkingGeometryEstimator
+from ..estimation.parking_geometry import (
+    ParkingGeometry,
+    ParkingGeometryEstimator,
+    merge_camera_back_line,
+)
 from ..estimation.parking_lidar import (
     LidarParkingObservation,
     LidarParkingSpaceEstimator,
@@ -35,7 +39,12 @@ from ..parking_config import ParkingAppConfig, load_parking_config
 from ..perception.bev import BevTransformer
 from ..perception.yolo_lane import YoloLaneConfig, YoloLaneSegmenter
 from ..planning.t_parking_planner import ParkingState, TParkingPlanner
-from ..sensors.lidar import LidarCsvReplay, RplidarScanner, find_lidar_port
+from ..sensors.lidar import (
+    LidarCsvRecorder,
+    LidarCsvReplay,
+    RplidarScanner,
+    find_lidar_port,
+)
 
 
 LOG = logging.getLogger("skku_autocar.parking")
@@ -131,6 +140,25 @@ def dashboard_recording_enabled(mode: str, is_video: bool) -> bool:
     if mode == "off":
         return False
     return not is_video
+
+
+def timestamped_lidar_csv_path(directory: str, now: Optional[datetime] = None) -> Path:
+    root = resolve_path(directory)
+    timestamp = (now or datetime.now().astimezone()).strftime("%Y%m%d_%H%M%S")
+    candidate = root / (timestamp + "_lidar.csv")
+    suffix = 1
+    while candidate.exists():
+        candidate = root / ("%s_%02d_lidar.csv" % (timestamp, suffix))
+        suffix += 1
+    return candidate
+
+
+def lidar_csv_recording_enabled(mode: str, has_live_scanner: bool) -> bool:
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    return has_live_scanner
 
 
 def make_locked_slot_tracker(config: ParkingAppConfig) -> LockedSlotTracker:
@@ -278,6 +306,11 @@ def run_prepared(args: argparse.Namespace) -> int:
     if lidar_port is not None:
         lidar_scanner = RplidarScanner(lidar_port)
         lidar_scanner.start()
+        try:
+            lidar_scanner.wait_ready(config.runtime.lidar_connect_timeout_s)
+        except Exception:
+            lidar_scanner.close()
+            raise
         LOG.info("lidar scanner started: %s", lidar_port)
     if config.runtime.require_lidar and lidar_replay is None and lidar_scanner is None and not args.allow_no_lidar:
         raise RuntimeError("LiDAR is required: pass --lidar-csv, --lidar-port, or explicitly --allow-no-lidar")
@@ -304,6 +337,7 @@ def run_prepared(args: argparse.Namespace) -> int:
     last_ultrasonic: Optional[UltrasonicReadings] = None
     last_ultrasonic_at = float("-inf")
     run_started_at = time.monotonic()
+    run_timestamp = datetime.now().astimezone()
     last_frame_at = run_started_at
     fps = 0.0
     frame_index = args.start_frame
@@ -327,13 +361,23 @@ def run_prepared(args: argparse.Namespace) -> int:
     dashboard_recorder: Optional[DashboardVideoRecorder] = None
     dashboard_record_path: Optional[Path] = None
     if dashboard_recording_enabled(args.record_dashboard, is_replay):
-        dashboard_record_path = timestamped_dashboard_path(args.parking_record_dir)
+        dashboard_record_path = timestamped_dashboard_path(
+            args.parking_record_dir, run_timestamp
+        )
         dashboard_recorder = DashboardVideoRecorder(
             cv2,
             dashboard_record_path,
             args.dashboard_record_fps,
         )
         LOG.info("dashboard recording enabled: %s", dashboard_record_path)
+
+    lidar_csv_recorder: Optional[LidarCsvRecorder] = None
+    if lidar_csv_recording_enabled(args.record_lidar_csv, lidar_scanner is not None):
+        lidar_csv_record_path = timestamped_lidar_csv_path(
+            args.parking_record_dir, run_timestamp
+        )
+        lidar_csv_recorder = LidarCsvRecorder(str(lidar_csv_record_path))
+        LOG.info("lidar CSV recording enabled: %s", lidar_csv_record_path)
 
     try:
         while True:
@@ -397,6 +441,8 @@ def run_prepared(args: argparse.Namespace) -> int:
                 elapsed + args.lidar_offset + config.runtime.lidar_video_offset_s,
                 args.allow_no_lidar,
             )
+            if lidar_csv_recorder is not None and lidar_scan is not None:
+                lidar_csv_recorder.write_scan(lidar_scan)
             lidar_points = lidar_estimator.vehicle_points(lidar_scan)
             # The two bordering cars determine an official-size 950 x 1500 mm
             # bay. Fresh, consistent two-car observations re-anchor its pose;
@@ -407,6 +453,10 @@ def run_prepared(args: argparse.Namespace) -> int:
                 lock_requested=planner.state in LOCKED_SLOT_STATES,
             )
             locked_slot_pose = locked_slot_geometry.pose
+            # LiDAR gets no return off the painted back line, so its slot-box
+            # depth is only a geometric guess; the camera/YOLO line detector
+            # sees the real paint and is the trustworthy stop signal.
+            geometry = merge_camera_back_line(geometry, camera_geometry)
             ultrasonic_fresh = (
                 last_ultrasonic is not None
                 and monotonic_now - last_ultrasonic_at
@@ -577,6 +627,14 @@ def run_prepared(args: argparse.Namespace) -> int:
                 )
         if lidar_scanner is not None:
             lidar_scanner.close()
+        if lidar_csv_recorder is not None:
+            lidar_csv_recorder.close()
+            if lidar_csv_recorder.scans_written > 0:
+                LOG.info(
+                    "lidar CSV recording saved: %s (%d scans)",
+                    lidar_csv_recorder.path,
+                    lidar_csv_recorder.scans_written,
+                )
         if cap is not None:
             cap.release()
         cv2.destroyAllWindows()
@@ -1865,6 +1923,12 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         "--parking-record-dir",
         default="data/parking",
         help="directory for timestamped live dashboard MP4 files",
+    )
+    parser.add_argument(
+        "--record-lidar-csv",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="record raw LiDAR scans to CSV; auto records whenever a live scanner is active",
     )
     parser.add_argument(
         "--dashboard-record-fps",

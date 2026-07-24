@@ -196,6 +196,7 @@
     "command_rate_hz": 20.0,
     "lidar_video_offset_s": 0.0,
     "require_lidar": true,
+    "lidar_connect_timeout_s": 5.0,
     "debug_window": true,
     "lidar_display_rotation_deg": 0.0,
     "lidar_debug_vehicle_width_mm": 600.0,

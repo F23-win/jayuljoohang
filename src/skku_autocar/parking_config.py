@@ -28,6 +28,7 @@ class ParkingRuntimeConfig:
     command_rate_hz: float = 20.0
     lidar_video_offset_s: float = 0.0
     require_lidar: bool = True
+    lidar_connect_timeout_s: float = 5.0
     debug_window: bool = True
     lidar_display_rotation_deg: float = 0.0
     # Legacy ``lidar_debug_*`` names are retained for config compatibility, but

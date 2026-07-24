@@ -11,9 +11,11 @@ from typing import Any, Optional
 from ..control.serial_vehicle import SerialVehicleClient, SerialVehicleConfig
 from ..estimation.bev_corridor import BevCorridorConfig, BevCorridorLaneEstimator, warp_class_masks
 from ..estimation.lane_geometry import LaneGeometry
+from ..estimation.parking_lidar import LidarParkingConfig, LidarParkingSpaceEstimator
 from ..perception.bev import BevConfig, BevTransformer
 from ..perception.yolo_lane import YoloClassMasks, YoloLaneConfig, YoloLaneMask, YoloLaneSegmenter
 from ..planning.yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
+from ..sensors.lidar import RplidarScanner, find_lidar_port
 from ..types import ControlCommand
 
 
@@ -72,6 +74,32 @@ def run(args: argparse.Namespace) -> int:
     else:
         LOG.info("serial disabled: dry video/control preview mode")
 
+    # M1 entry-pose measurement: stop and latch once the rear LiDAR confirms the
+    # first bordering car's slot-adjacent edge, i.e. the point where the T-parking
+    # runtime would start its left prealign turn. Reuses the already-tuned
+    # LidarParkingSpaceEstimator trigger instead of a new detector.
+    entry_stop_enabled = args.stop_at_parking_entry == "on"
+    lidar_scanner: Optional[RplidarScanner] = None
+    lidar_estimator: Optional[LidarParkingSpaceEstimator] = None
+    entry_reached = False
+    if entry_stop_enabled:
+        lidar_port = find_lidar_port(args.lidar_port)
+        if lidar_port is None:
+            raise RuntimeError(
+                "LiDAR serial port was not found for --stop-at-parking-entry. Pass --lidar-port explicitly."
+            )
+        lidar_scanner = RplidarScanner(lidar_port)
+        lidar_scanner.start()
+        try:
+            lidar_scanner.wait_ready(args.lidar_ready_timeout)
+        except Exception:
+            lidar_scanner.close()
+            raise
+        lidar_estimator = LidarParkingSpaceEstimator(
+            LidarParkingConfig(first_car_turn_target_y_back_mm=args.parking_entry_target_y_back_mm)
+        )
+        LOG.info("lidar scanner started for parking-entry stop: %s", lidar_port)
+
     cap = open_camera(cv2, args.camera, args.width, args.height, args.fourcc)
     # A video-file source (not a live camera index) should loop for review instead
     # of erroring out at the end of the clip.
@@ -125,6 +153,20 @@ def run(args: argparse.Namespace) -> int:
             planned_command = follower.plan(lane) if running else ControlCommand.stop("paused")
             command = command_filter.apply(mask_result, lane, planned_command, running)
 
+            if entry_stop_enabled and not entry_reached:
+                observation = lidar_estimator.estimate(lidar_scanner.latest(), now=now)
+                if observation.first_car_turn_reached:
+                    entry_reached = True
+                    LOG.info(
+                        "parking entry reached: edge_x=%.1fmm edge_y=%.1fmm turn_error=%.1fmm",
+                        observation.first_car_slot_edge_x_right_mm,
+                        observation.first_car_slot_edge_y_back_mm,
+                        observation.first_car_turn_error_mm,
+                    )
+            if entry_reached:
+                running = False
+                command = ControlCommand.stop("parking_entry_reached")
+
             if vehicle is not None and now - last_command_at >= 1.0 / args.command_rate:
                 vehicle.send(command)
                 last_command_at = now
@@ -165,6 +207,8 @@ def run(args: argparse.Namespace) -> int:
                     LOG.warning("serial stop failed during shutdown: %s", exc)
             finally:
                 vehicle.close()
+        if lidar_scanner is not None:
+            lidar_scanner.close()
         cap.release()
         cv2.destroyAllWindows()
     return 0
@@ -521,6 +565,21 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument("--ready-timeout", type=float, default=3.0)
     parser.add_argument("--no-serial", action="store_true", help="run without Arduino output")
+    parser.add_argument(
+        "--stop-at-parking-entry",
+        choices=("on", "off"),
+        default="off",
+        help="M1 measurement mode: latch a stop once the rear LiDAR confirms the parking-entry point, "
+        "so the stopped pose can be marked/measured by hand",
+    )
+    parser.add_argument("--lidar-port", default=None, help="LiDAR serial port; auto-detected when omitted")
+    parser.add_argument("--lidar-ready-timeout", type=float, default=5.0)
+    parser.add_argument(
+        "--parking-entry-target-y-back-mm",
+        type=float,
+        default=LidarParkingConfig().first_car_turn_target_y_back_mm,
+        help="rear-LiDAR y_back (mm) of the first bordering car's slot-adjacent edge that defines the entry point",
+    )
     parser.add_argument("--speed", type=int, default=105)
     parser.add_argument(
         "--fixed-speed",
