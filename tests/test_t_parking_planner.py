@@ -116,6 +116,7 @@ class TParkingPlannerTest(unittest.TestCase):
                 path_confirm_frames=1,
                 reverse_entry_steer_settle_s=0.0,
                 reverse_entry_release_confirm_frames=1,
+                reverse_entry_continuous_steering=False,
                 entry_curve_timeout_s=100.0,
                 center_follow_timeout_s=100.0,
                 exit_straight_s=3.0,
@@ -166,6 +167,7 @@ class TParkingPlannerTest(unittest.TestCase):
                 path_confirm_frames=1,
                 reverse_entry_steer_settle_s=0.0,
                 reverse_entry_release_confirm_frames=1,
+                reverse_entry_continuous_steering=False,
                 entry_curve_timeout_s=100.0,
                 center_follow_timeout_s=100.0,
             ),
@@ -775,6 +777,56 @@ class TParkingPlannerTest(unittest.TestCase):
             self.assertEqual(plan.command.steering, planner.config.max_steering)
             self.assertIn("following_entry_fixed_max_right", plan.reason)
 
+    def test_curve_reverse_continuous_recomputes_steering_from_path_side(self):
+        # Continuous entry steering (the default) recomputes from the BEV path
+        # curvature every frame instead of holding a constant max-right, so a
+        # left-biased path and a right-biased path steer to opposite sides --
+        # while still honoring the reverse_entry_min_steering floor.
+        planner = TParkingPlanner(
+            ParkingPlannerConfig(
+                prealign_enabled=False,
+                start_forward_s=0.0,
+                verify_hold_s=0.0,
+                aligned_confirm_frames=1,
+                search_timeout_s=100.0,
+                gap_tracking_timeout_s=100.0,
+                position_timeout_s=100.0,
+                verify_timeout_s=100.0,
+                path_timeout_s=100.0,
+                path_confirm_frames=1,
+                reverse_entry_steer_settle_s=0.0,
+                reverse_entry_release_confirm_frames=1,
+                reverse_entry_continuous_steering=True,
+                reverse_entry_release_heading_deg=1.0,
+                entry_curve_timeout_s=100.0,
+                center_follow_timeout_s=100.0,
+            ),
+            ReversePathConfig(maximum_curvature_per_px=0.05),
+        )
+        self.arm_reverse(planner)
+
+        left = planner.update(
+            geometry(heading=45.0, lateral=-0.60, remaining=700.0, reason="lidar_slot_box"),
+            lidar_gap(0.0, reached=True),
+            0.5,
+        )
+        right = planner.update(
+            geometry(heading=30.0, lateral=0.60, remaining=680.0, reason="lidar_slot_box"),
+            lidar_gap(0.0, reached=True),
+            0.6,
+        )
+
+        self.assertEqual(left.state, ParkingState.FOLLOW_ENTRY_CURVE)
+        # Opposite-side paths → opposite curvature signs → opposite steering,
+        # unlike fixed mode which pins both to the same constant max-right.
+        self.assertLess(left.path.curvature_per_px, 0.0)
+        self.assertGreater(right.path.curvature_per_px, 0.0)
+        self.assertLess(left.command.steering, 0)
+        self.assertGreater(right.command.steering, 0)
+        floor = planner.config.reverse_entry_min_steering
+        self.assertGreaterEqual(abs(left.command.steering), floor)
+        self.assertIn("following_entry_curve", left.reason)
+
     def test_curve_reverse_releases_after_stable_heading_confirmation(self):
         planner = TParkingPlanner(
             ParkingPlannerConfig(
@@ -1000,6 +1052,7 @@ class TParkingPlannerTest(unittest.TestCase):
                 path_timeout_s=100.0,
                 path_confirm_frames=1,
                 reverse_entry_steer_settle_s=0.4,
+                reverse_entry_continuous_steering=False,
                 entry_curve_timeout_s=100.0,
             ),
             ReversePathConfig(maximum_curvature_per_px=0.05),

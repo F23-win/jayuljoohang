@@ -77,6 +77,36 @@ class LockedSlotTrackerTest(unittest.TestCase):
         self.assertEqual(first.polygon, polygon)
         self.assertTrue(lost.lost)
         self.assertEqual(lost.reason, "locked_slot_lost")
+        self.assertEqual((first.hold_scans, second.hold_scans, lost.hold_scans), (1, 2, 3))
+
+    def test_motion_gate_rejection_reports_the_attempted_motion(self):
+        # A real ~23mm ICP solution (see test_consecutive_scan_motion_moves_same_locked_rectangle)
+        # rejected by a tight gate should still surface how far it tried to move,
+        # not silently report 0 -- that number is what tells you whether the gate
+        # is too tight or the pose genuinely diverged.
+        previous = static_scene()
+        current = [(x - 20.0, y - 12.0) for x, y in previous]
+        polygon = ((-475.0, 0.0), (475.0, 0.0), (475.0, 1500.0), (-475.0, 1500.0))
+        tracker = LockedSlotTracker(
+            LockedSlotTrackerConfig(
+                min_points=10,
+                max_points=120,
+                max_correspondence_mm=180.0,
+                trim_ratio=0.8,
+                iterations=8,
+                max_translation_per_scan_mm=5.0,
+                max_rotation_per_scan_deg=5.0,
+                max_hold_scans=5,
+            )
+        )
+
+        tracker.lock(polygon, previous)
+        rejected = tracker.update(current)
+
+        self.assertTrue(rejected.held)
+        self.assertEqual(rejected.reason, "locked_slot_motion_gate_rejected")
+        self.assertEqual(rejected.hold_scans, 1)
+        self.assertGreater(rejected.translation_mm, 5.0)
 
     def test_eight_nearby_points_are_enough_for_stationary_slot_tracking(self):
         tracker = LockedSlotTracker(

@@ -100,6 +100,13 @@ class LidarParkingConfig:
     gap_candidate_hold_s: float = 1.2
     gap_single_cluster_track_enabled: bool = True
     gap_single_cluster_max_edge_jump_mm: float = 700.0
+    # 두 번째 차(gap)를 기다리지 않고 확정된 첫 차 1대만으로 슬롯 박스를 만든다.
+    # 첫 차의 슬롯 인접 모서리를 한쪽 벽으로, 대회 규격 폭(parking_space_width_mm)만큼
+    # 진입 방향(-y_back)으로 떨어진 지점을 반대쪽 벽으로 두고, 깊이는 차량-오른쪽(+x)으로
+    # parking_space_depth_mm만큼 낸다. 이 방위 가정은 좌조향 시작 시점(차량이 도로와
+    # 거의 평행)에서만 유효하므로, 두 차가 보이면 즉시 재기준(reanchor)되도록 설계했다.
+    # 방위 가정 오류로 하드웨어에서 잘못 후진할 수 있어 기본값은 꺼둔다.
+    single_car_slot_enabled: bool = False
     gap_coast_scans: int = 15
     # Keep displaying the last confirmed slot for the current mission when
     # both bordering cars are temporarily unavailable. Coasted observations
@@ -118,6 +125,15 @@ class LidarParkingConfig:
     first_car_confirm_scans: int = 2
     first_car_min_x_right_mm: float = 250.0
     first_car_turn_target_y_back_mm: float = -650.0
+    # A parked car presents a dense, straight body panel to the LiDAR. A person
+    # standing beside the vehicle returns a sparse, rounded (low-linearity)
+    # blob. Requiring a minimum point count and surface linearity here keeps a
+    # person from being accepted as the first car and prematurely triggering the
+    # left turn. 0 for either threshold disables that check. Defaults are
+    # disabled here; the real thresholds live in configs/parking.json so minimal
+    # synthetic clusters in unit tests are unaffected.
+    first_car_min_points: int = 0
+    first_car_min_linearity: float = 0.0
 
     # Positive y_back is behind the sensor. The LiDAR is provisionally 30 cm
     # behind the rear axle, so the rear axle is at negative y_back. Replace this
@@ -325,6 +341,21 @@ class LidarParkingSpaceEstimator:
             and first_car_turn_error <= 0.0
         )
 
+        # Bootstrap a slot box from the single confirmed first car when no
+        # two-car gap is available. gap_pair_observed stays False so the locked
+        # slot tracker never treats this as a strong pair for re-anchoring; a
+        # real gap, once seen, still overrides it.
+        single_car_slot = False
+        if (
+            candidate is None
+            and valid
+            and self.config.single_car_slot_enabled
+            and first_car is not None
+            and first_car_confirmed
+        ):
+            candidate = single_car_slot_gap(first_car, self.config)
+            single_car_slot = True
+
         if new_scan:
             self._update_tracking(candidate, scan.timestamp)
             self._last_timestamp = scan.timestamp
@@ -371,9 +402,10 @@ class LidarParkingSpaceEstimator:
         elif self._confirmed and entry_reached:
             reason = "rear_axle_aligned"
         elif self._confirmed and gap_found:
-            reason = "gap_confirmed"
+            reason = "gap_confirmed:single_car" if single_car_slot else "gap_confirmed"
         elif candidate is not None:
-            reason = "gap_confirming:%d/%d" % (
+            reason = "%s:%d/%d" % (
+                "single_car_confirming" if single_car_slot else "gap_confirming",
                 self._confirm_scans,
                 max(1, self.config.gap_confirm_scans),
             )
@@ -703,17 +735,31 @@ def select_first_approach_car(
     Stationary objects move from negative to positive ``y_back`` while the ego
     vehicle drives forward.  The first car is consequently the right-side
     cluster with the largest longitudinal center once multiple clusters enter
-    the ROI.
+    the ROI. Sparse or rounded clusters (typically people beside the vehicle)
+    are rejected so they never trigger the preemptive left turn.
     """
 
     candidates = [
         cluster
         for cluster in clusters
         if cluster.center_x_right_mm >= config.first_car_min_x_right_mm
+        and is_first_car_eligible(cluster, config)
     ]
     if not candidates:
         return None
     return max(candidates, key=lambda cluster: cluster.center_y_back_mm)
+
+
+def is_first_car_eligible(cluster: CarCluster, config: LidarParkingConfig) -> bool:
+    """Reject person-like (sparse/rounded) clusters from being the first car."""
+    if config.first_car_min_points > 0 and cluster.point_count < config.first_car_min_points:
+        return False
+    if (
+        config.first_car_min_linearity > 0.0
+        and cluster.surface_linearity < config.first_car_min_linearity
+    ):
+        return False
+    return True
 
 
 def is_gap_cluster_eligible(
@@ -880,6 +926,36 @@ def choose_gap(
         ),
     )
     return width, first_y, second_y, first_x, second_x, depth_x, depth_y
+
+
+def single_car_slot_gap(
+    first_car: CarCluster,
+    config: LidarParkingConfig,
+) -> Tuple[float, float, float, float, float, float, float]:
+    """Synthesize a gap tuple from one bordering car (no second car needed).
+
+    The competition guarantees the empty bay sits immediately ahead of the
+    first parked car, so a single confirmed car is enough to bootstrap the slot
+    box. The car's LiDAR-facing, slot-adjacent corner becomes one bay-mouth wall;
+    the other wall is one official bay width (``parking_space_width_mm``) further
+    along the approach (decreasing ``y_back``). Depth points toward vehicle-right
+    (+x), into the row of parked cars.
+
+    The orientation is only valid while the ego is roughly parallel to the road
+    (i.e. at the left-turn trigger). Once two cars are visible, ``choose_gap`` and
+    the locked-slot re-anchor override this bootstrap. Returns the same
+    ``(width, first_y, second_y, first_x, second_x, depth_x, depth_y)`` tuple as
+    ``choose_gap`` so it flows through the identical tracking/projection path.
+    """
+
+    # LiDAR-facing corner (nearest x to the sensor at x=0) on the slot-adjacent
+    # edge (minimum y_back, toward the upcoming bay).
+    near_x = first_car.x_min_mm
+    near_y = first_car.y_back_min_mm
+    width = max(1.0, config.parking_space_width_mm)
+    far_x = near_x
+    far_y = near_y - width  # one bay width along the approach (-y_back)
+    return (width, near_y, far_y, near_x, far_x, 1.0, 0.0)
 
 
 def infer_dynamic_slot_polygon(

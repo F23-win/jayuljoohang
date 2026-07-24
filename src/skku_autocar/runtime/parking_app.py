@@ -546,6 +546,7 @@ def run_prepared(args: argparse.Namespace) -> int:
                 camera_enabled=camera_enabled,
                 front_left_ultrasonic_mm=front_left_ultrasonic_mm,
                 front_right_ultrasonic_mm=front_right_ultrasonic_mm,
+                locked_slot_pose=locked_slot_pose,
             )
             cv2.imshow("T Parking - Live Dashboard", dashboard)
             if dashboard_recorder is not None:
@@ -779,6 +780,7 @@ def draw_live_dashboard(
     camera_enabled: bool = True,
     front_left_ultrasonic_mm: Optional[float] = None,
     front_right_ultrasonic_mm: Optional[float] = None,
+    locked_slot_pose: Optional[LockedSlotPose] = None,
 ) -> Any:
     state_color = parking_state_color(plan.state)
     wall_time = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
@@ -794,6 +796,7 @@ def draw_live_dashboard(
         if geometry.depth_remaining_px is None
         else "%.1fpx" % geometry.depth_remaining_px
     )
+    track = locked_slot_pose if locked_slot_pose is not None else LockedSlotPose()
     status_lines = (
         "%s | MOTOR=%s | REC=%s" % (
             "LIVE CAMERA" if camera_enabled else "LIDAR ONLY",
@@ -840,6 +843,15 @@ def draw_live_dashboard(
             geometry.heading_error_deg,
             depth,
             geometry.reason,
+        ),
+        "TRACK locked=%s held=%s(%d) lost=%s icp_d=%.0fmm icp_rot=%+.1fdeg (%s)" % (
+            "Y" if track.locked else "N",
+            "Y" if track.held else "N",
+            track.hold_scans,
+            "Y" if track.lost else "N",
+            track.translation_mm,
+            track.rotation_deg,
+            track.reason,
         ),
         "ULTRASONIC FL=%s FR=%s | SL=%s SR=%s cm | BODY_MID_INSIDE=%s" % (
             format_dashboard_value(
@@ -1785,6 +1797,8 @@ def apply_cli_overrides(config: ParkingAppConfig, args: argparse.Namespace) -> P
             lidar,
             first_car_turn_target_y_back_mm=args.first_car_turn_target_cm * 10.0,
         )
+    if args.single_car_slot is not None:
+        lidar = replace(lidar, single_car_slot_enabled=args.single_car_slot == "on")
     runtime = config.runtime
     if args.camera_enabled is not None:
         runtime = replace(runtime, camera_enabled=args.camera_enabled)
@@ -1980,6 +1994,12 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         type=float,
         default=None,
         help="vehicle-frame yBack trigger for the first car; negative is ahead",
+    )
+    parser.add_argument(
+        "--single-car-slot",
+        choices=("on", "off"),
+        default=None,
+        help="build the slot box from one confirmed car without waiting for the second (validate on a recording first)",
     )
     parser.add_argument(
         "--first-car-preemptive-turn",

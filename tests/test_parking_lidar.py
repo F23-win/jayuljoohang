@@ -12,6 +12,7 @@ from skku_autocar.estimation.parking_lidar import (
     infer_dynamic_slot_polygon,
     choose_gap,
     is_gap_cluster_eligible,
+    single_car_slot_gap,
     summarize_cluster,
 )
 from skku_autocar.sensors.lidar import (
@@ -81,6 +82,131 @@ class ParkingLidarTest(unittest.TestCase):
         self.assertAlmostEqual(rear[1], 1000.0, delta=1.0)
         self.assertAlmostEqual(left[0], -1000.0, delta=1.0)
         self.assertAlmostEqual(left[1], 0.0, delta=1.0)
+
+    def test_first_car_rejects_sparse_or_rounded_person_cluster(self):
+        from skku_autocar.estimation.parking_lidar import (
+            is_first_car_eligible,
+            select_first_approach_car,
+        )
+
+        config = LidarParkingConfig(
+            first_car_min_x_right_mm=250.0,
+            first_car_min_points=6,
+            first_car_min_linearity=0.5,
+        )
+        # Dense, straight body panel (a real car): many points, high linearity.
+        car = CarCluster(
+            point_count=12,
+            x_min_mm=900.0,
+            x_max_mm=1100.0,
+            y_back_min_mm=-700.0,
+            y_back_max_mm=-500.0,
+            surface_linearity=0.9,
+        )
+        # Sparse, rounded blob (a person): few points, low linearity.
+        person = CarCluster(
+            point_count=3,
+            x_min_mm=800.0,
+            x_max_mm=900.0,
+            y_back_min_mm=100.0,
+            y_back_max_mm=200.0,
+            surface_linearity=0.2,
+        )
+        self.assertTrue(is_first_car_eligible(car, config))
+        self.assertFalse(is_first_car_eligible(person, config))
+        # With both present, only the car qualifies as the first car.
+        self.assertEqual(select_first_approach_car((person, car), config), car)
+        # A person alone yields no first car (no premature turn trigger).
+        self.assertIsNone(select_first_approach_car((person,), config))
+
+    def test_first_car_eligibility_disabled_by_default(self):
+        from skku_autocar.estimation.parking_lidar import is_first_car_eligible
+
+        person = CarCluster(
+            point_count=3,
+            x_min_mm=800.0,
+            x_max_mm=900.0,
+            y_back_min_mm=100.0,
+            y_back_max_mm=200.0,
+            surface_linearity=0.2,
+        )
+        # Default config disables the check, so minimal clusters still pass.
+        self.assertTrue(is_first_car_eligible(person, LidarParkingConfig()))
+
+    def test_single_car_slot_gap_builds_box_from_one_car(self):
+        car = CarCluster(
+            point_count=5,
+            x_min_mm=900.0,
+            x_max_mm=1100.0,
+            y_back_min_mm=-700.0,
+            y_back_max_mm=-500.0,
+        )
+        gap = single_car_slot_gap(car, LidarParkingConfig(parking_space_width_mm=950.0))
+        width, first_y, second_y, first_x, second_x, depth_x, depth_y = gap
+        self.assertEqual(width, 950.0)
+        # LiDAR-facing, slot-adjacent corner (x_min, y_back_min).
+        self.assertEqual((first_x, first_y), (900.0, -700.0))
+        # Other wall one official bay width along the approach (-y_back).
+        self.assertEqual((second_x, second_y), (900.0, -1650.0))
+        # Depth points into vehicle-right (+x).
+        self.assertEqual((depth_x, depth_y), (1.0, 0.0))
+
+    def test_single_car_slot_confirms_without_second_car(self):
+        config = replace(
+            self.make_estimator().config,
+            single_car_slot_enabled=True,
+            first_car_confirm_scans=1,
+            gap_confirm_scans=2,
+            parking_space_width_mm=950.0,
+            parking_space_depth_mm=1500.0,
+        )
+        estimator = LidarParkingSpaceEstimator(config)
+        one_car = tuple(
+            point_at(x, y)
+            for x, y in ((950.0, -720.0), (1000.0, -700.0), (1050.0, -680.0))
+        )
+        observation = None
+        reasons = []
+        for index in range(4):
+            observation = estimator.estimate(
+                LidarScan(float(index), one_car), now=float(index)
+            )
+            reasons.append(observation.reason)
+        self.assertTrue(observation.gap_found)
+        self.assertTrue(observation.gap_confirmed)
+        # A single car must never be reported as a strong two-car pair, so the
+        # locked-slot tracker never re-anchors on it.
+        self.assertFalse(observation.gap_pair_observed)
+        # The single-car origin is visible while the box is confirming (after
+        # confirmation the single-cluster edge tracker maintains it).
+        self.assertTrue(
+            any("single_car" in reason for reason in reasons),
+            reasons,
+        )
+        polygon = infer_dynamic_slot_polygon(
+            observation, config.parking_space_depth_mm, config.parking_space_width_mm
+        )
+        self.assertIsNotNone(polygon)
+        self.assertEqual(len(polygon), 4)
+
+    def test_single_car_slot_disabled_by_default(self):
+        config = replace(
+            self.make_estimator().config,
+            first_car_confirm_scans=1,
+            gap_confirm_scans=2,
+        )
+        self.assertFalse(config.single_car_slot_enabled)
+        estimator = LidarParkingSpaceEstimator(config)
+        one_car = tuple(
+            point_at(x, y)
+            for x, y in ((950.0, -720.0), (1000.0, -700.0), (1050.0, -680.0))
+        )
+        observation = None
+        for index in range(4):
+            observation = estimator.estimate(
+                LidarScan(float(index), one_car), now=float(index)
+            )
+        self.assertFalse(observation.gap_found)
 
     @staticmethod
     def two_car_points(offset=0.0):

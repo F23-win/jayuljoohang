@@ -43,8 +43,13 @@ class LockedSlotPose:
     tracked: bool = False
     held: bool = False
     lost: bool = False
+    # Per-scan ICP translation/rotation. On a rejected (gated) solution these
+    # still carry the attempted motion, not 0, so a dashboard can show what the
+    # gate refused instead of just that it refused something.
     translation_mm: float = 0.0
     rotation_deg: float = 0.0
+    # Consecutive hold count since the last successful lock/reanchor/track.
+    hold_scans: int = 0
     reason: str = "slot_not_locked"
 
 
@@ -130,7 +135,11 @@ class LockedSlotTracker:
             translation_mm > max(0.0, self.config.max_translation_per_scan_mm)
             or abs(rotation_deg) > max(0.0, self.config.max_rotation_per_scan_deg)
         ):
-            return self._hold("locked_slot_motion_gate_rejected")
+            return self._hold(
+                "locked_slot_motion_gate_rejected",
+                translation_mm=translation_mm,
+                rotation_deg=rotation_deg,
+            )
 
         # ICP returns previous ~= R * current + t.  The slot is stored in the
         # previous frame, so apply the inverse to express it in the current frame.
@@ -168,7 +177,12 @@ class LockedSlotTracker:
             filtered = [filtered[index] for index in indexes]
         return np.asarray(filtered, dtype=np.float64)
 
-    def _hold(self, reason: str) -> LockedSlotPose:
+    def _hold(
+        self,
+        reason: str,
+        translation_mm: float = 0.0,
+        rotation_deg: float = 0.0,
+    ) -> LockedSlotPose:
         self._hold_scans += 1
         lost = self._hold_scans > max(0, self.config.max_hold_scans)
         return LockedSlotPose(
@@ -176,6 +190,9 @@ class LockedSlotTracker:
             locked=True,
             held=not lost,
             lost=lost,
+            translation_mm=translation_mm,
+            rotation_deg=rotation_deg,
+            hold_scans=self._hold_scans,
             reason="locked_slot_lost" if lost else reason,
         )
 

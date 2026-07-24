@@ -79,6 +79,10 @@ class ParkingPlannerConfig:
     reverse_entry_steer_settle_s: float = 0.40
     reverse_entry_release_heading_deg: float = 12.0
     reverse_entry_release_confirm_frames: int = 3
+    # lidar_box_curve 진입에서 max 고정 조향을 heading 풀릴 때까지 유지하는 대신,
+    # 매 프레임 BEV 경로 곡률로 조향을 재계산해 계속 자세제어한다. reverse_entry_min_steering
+    # 바닥은 유지되므로 진입 초반엔 여전히 세게 꺾는다. False면 기존 고정 조향으로 되돌아간다.
+    reverse_entry_continuous_steering: bool = True
     correction_enabled: bool = True
     correction_forward_speed: int = 22
     correction_reverse_speed: int = -28
@@ -609,7 +613,16 @@ class TParkingPlanner:
                 return self._stop("entry_curve_path_lost:%s" % path.reason, path)
             if self._reverse_entry_mode == "lidar_box_curve":
                 elapsed = self._state_elapsed(now)
-                steering = self._fixed_right_entry_steering()
+                # 기존: heading 풀릴 때까지 max 고정 조향 유지. 개선: 매 프레임 경로
+                # 곡률로 재계산해 계속 자세제어(진입 초반 min_steering 바닥은 유지).
+                if self.config.reverse_entry_continuous_steering:
+                    steering = self._entry_curve_steering(
+                        path,
+                        left_ultrasonic_mm,
+                        right_ultrasonic_mm,
+                    )
+                else:
+                    steering = self._fixed_right_entry_steering()
                 if elapsed < max(0.0, self.config.reverse_entry_steer_settle_s):
                     self._entry_heading_ready_frames = 0
                     return self._drive(
@@ -647,11 +660,12 @@ class TParkingPlanner:
                     self.config.reverse_entry_speed,
                     steering,
                     (
-                        "following_entry_fixed_max_right:"
-                        "heading=%+.1f confirm=%d/%d"
+                        "following_entry_%s:heading=%+.1f steer=%+d confirm=%d/%d"
                     )
                     % (
+                        "curve" if self.config.reverse_entry_continuous_steering else "fixed_max_right",
                         geometry.heading_error_deg,
+                        steering,
                         self._entry_heading_ready_frames,
                         required_frames,
                     ),
