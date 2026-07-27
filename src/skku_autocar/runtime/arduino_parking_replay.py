@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from ..estimation.locked_slot import LockedSlotPose
 from ..estimation.parking_geometry import (
     ParkingGeometry,
+    ParkingGeometryDepthStabilizer,
     ParkingGeometryEstimator,
     filter_parking_car_masks,
     merge_camera_back_line,
@@ -37,6 +38,7 @@ from .parking_app import (
     draw_parking_line,
     draw_reverse_path,
     extract_recording_zip,
+    filter_bev_visible_line_masks,
     make_locked_slot_geometry,
     parking_mask_color,
     validate_parking_model,
@@ -823,6 +825,11 @@ def run_visual_replay(
         validate_parking_model(segmenter)
     transformer = BevTransformer(config.bev)
     geometry_estimator = ParkingGeometryEstimator(config.geometry)
+    depth_stabilizer = ParkingGeometryDepthStabilizer(
+        max_jump_px=config.geometry.max_depth_jump_px,
+        reconfirm_frames=config.geometry.merged_depth_reconfirm_frames,
+        candidate_tolerance_px=config.geometry.merged_depth_candidate_tolerance_px,
+    )
     lidar_estimator = LidarParkingSpaceEstimator(config.lidar)
     locked_slot_geometry = make_locked_slot_geometry(config)
     controller = SharedParkingPlannerReplay(config)
@@ -887,9 +894,17 @@ def run_visual_replay(
                 )
             else:
                 class_masks = segmenter.segment_class_masks(frame)
-                car_masks = filter_parking_car_masks(class_masks.car)
-                selected_masks, selection_mode = geometry_estimator.select_masks(
+                car_masks = filter_parking_car_masks(
+                    class_masks.car,
+                    config.yolo.car_min_bottom_ratio,
+                )
+                visible_line_masks = filter_bev_visible_line_masks(
+                    transformer,
                     class_masks.lane,
+                    config.geometry.min_line_pixels,
+                )
+                selected_masks, selection_mode = geometry_estimator.select_masks(
+                    visible_line_masks,
                     car_masks,
                 )
                 frame_masks = list(selected_masks)
@@ -934,6 +949,7 @@ def run_visual_replay(
                     if controller.planner_state in CAMERA_GUIDED_STATES
                     else merge_camera_back_line(geometry, camera_geometry)
                 )
+                geometry = depth_stabilizer.update(geometry)
                 current_rear_cm = rear_lidar_distance_cm(current_scan, config)
                 old_state = controller.state
                 current_command = controller.update(
@@ -1376,9 +1392,17 @@ def analyze_camera(
                 frame_index += 1
                 continue
             class_masks = segmenter.segment_class_masks(frame)
-            car_masks = filter_parking_car_masks(class_masks.car)
-            selected_masks, selection_mode = estimator.select_masks(
+            car_masks = filter_parking_car_masks(
+                class_masks.car,
+                config.yolo.car_min_bottom_ratio,
+            )
+            visible_line_masks = filter_bev_visible_line_masks(
+                transformer,
                 class_masks.lane,
+                config.geometry.min_line_pixels,
+            )
+            selected_masks, selection_mode = estimator.select_masks(
+                visible_line_masks,
                 car_masks,
             )
             bev_masks = [transformer.warp_mask(mask) for mask in selected_masks]

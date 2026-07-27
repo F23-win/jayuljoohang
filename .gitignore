@@ -27,4 +27,6 @@ data/calibration/*
 
 trained_model/*.pt
 !trained_model/.gitkeep
+
+Ultralytics/
 Claude.md

@@ -3,10 +3,14 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
+from skku_autocar.estimation.parking_geometry import ParkingGeometry
 from skku_autocar.runtime.parking_app import (
     DashboardVideoRecorder,
     compose_parking_dashboard,
     dashboard_recording_enabled,
+    filter_bev_visible_line_masks,
+    parking_goal_visibility,
+    parking_slot_mode_label,
     parse_args,
     timestamped_dashboard_path,
 )
@@ -57,6 +61,39 @@ class ParkingDashboardTest(unittest.TestCase):
             ("REC=test.mp4",),
         )
         self.assertEqual(dashboard.shape, (720, 1280, 3))
+
+    def test_bev_status_exposes_virtual_gap_and_offscreen_goal(self):
+        geometry = ParkingGeometry(
+            found=True,
+            has_side_pair=True,
+            slot_center_x_px=-35.0,
+            selection_mode="single_car_left",
+        )
+
+        self.assertEqual(
+            parking_slot_mode_label(geometry.selection_mode),
+            "VIRTUAL_LEFT_OF_CAR",
+        )
+        self.assertEqual(parking_goal_visibility(geometry, 640), "OFFSCREEN_LEFT")
+
+    def test_line_selection_ignores_masks_outside_calibrated_bev(self):
+        class IdentityTransformer:
+            @staticmethod
+            def warp_mask(mask):
+                return mask
+
+        outside = self.np.zeros((10, 10), dtype=self.np.uint8)
+        visible = outside.copy()
+        visible.flat[:30] = 255
+
+        result = filter_bev_visible_line_masks(
+            IdentityTransformer(),
+            (outside, visible),
+            min_pixels=30,
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertIs(result[0], visible)
 
     def test_recorder_writes_readable_dashboard_mp4(self):
         with tempfile.TemporaryDirectory() as directory:

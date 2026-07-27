@@ -20,6 +20,7 @@ class ParkingYoloConfig:
     image_size: int = 640
     device: str = "auto"
     min_mask_area_ratio: float = 0.0003
+    car_min_bottom_ratio: float = 0.20
 
 
 @dataclass(frozen=True)

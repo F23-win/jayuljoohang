@@ -7,10 +7,12 @@ from pathlib import Path
 from skku_autocar.estimation.parking_lidar import (
     CarCluster,
     LidarParkingConfig,
+    LidarParkingObservation,
     LidarParkingSpaceEstimator,
     RectangleRoi,
     infer_dynamic_slot_polygon,
     choose_gap,
+    first_car_bearing_from_forward_deg,
     is_gap_cluster_eligible,
     single_car_slot_gap,
     summarize_cluster,
@@ -263,6 +265,51 @@ class ParkingLidarTest(unittest.TestCase):
         self.assertEqual(second.car_count, 1)
         self.assertFalse(second.gap_found)
         self.assertAlmostEqual(second.first_car_slot_edge_y_back_mm, -600.0)
+
+    def test_first_car_ignores_rear_obstacle_but_accepts_right_side_at_two_meters(self):
+        config = LidarParkingConfig(
+            angle_offset_deg=0.0,
+            car_detection_roi=RectangleRoi(250.0, 2600.0, -2500.0, 2500.0),
+            min_observed_points=3,
+            car_cluster_radius_mm=120.0,
+            car_cluster_min_points=3,
+            first_car_confirm_scans=1,
+            first_car_min_x_right_mm=250.0,
+            first_car_max_x_right_mm=2200.0,
+            first_car_acquire_y_back_max_mm=350.0,
+            first_car_turn_target_y_back_mm=0.0,
+        )
+
+        estimator = LidarParkingSpaceEstimator(config)
+
+        rear = tuple(point_at(x, y) for x, y in ((1950, 2350), (2000, 2400), (2050, 2450)))
+        rear_observation = estimator.estimate(LidarScan(1.0, rear), now=1.0)
+        approaching = tuple(point_at(x, y) for x, y in ((1950, -180), (2000, -150), (2050, -120)))
+        before_crossing = estimator.estimate(LidarScan(2.0, approaching), now=2.0)
+        alongside = tuple(point_at(x, y) for x, y in ((1950, 40), (2000, 70), (2050, 100)))
+        at_crossing = estimator.estimate(LidarScan(3.0, alongside), now=3.0)
+
+        self.assertEqual(rear_observation.car_count, 1)
+        self.assertFalse(rear_observation.first_car_seen)
+        self.assertFalse(rear_observation.first_car_turn_reached)
+        self.assertTrue(before_crossing.first_car_seen)
+        self.assertFalse(before_crossing.first_car_turn_reached)
+        self.assertTrue(at_crossing.first_car_seen)
+        self.assertTrue(at_crossing.first_car_turn_reached)
+        self.assertAlmostEqual(at_crossing.first_car_slot_edge_x_right_mm, 2000.0)
+
+    def test_first_car_bearing_uses_lidar_forward_as_zero(self):
+        right = LidarParkingObservation(
+            first_car_slot_edge_x_right_mm=1000.0,
+            first_car_slot_edge_y_back_mm=0.0,
+        )
+        rear_right = LidarParkingObservation(
+            first_car_slot_edge_x_right_mm=math.sin(math.radians(120.0)) * 1000.0,
+            first_car_slot_edge_y_back_mm=-math.cos(math.radians(120.0)) * 1000.0,
+        )
+
+        self.assertAlmostEqual(first_car_bearing_from_forward_deg(right), 90.0)
+        self.assertAlmostEqual(first_car_bearing_from_forward_deg(rear_right), 120.0)
 
     def test_non_right_side_clusters_do_not_trigger_first_car(self):
         config = replace(
@@ -765,6 +812,20 @@ class ParkingLidarTest(unittest.TestCase):
         self.assertTrue(observation.gap_found)
         self.assertTrue(observation.unsafe)
         self.assertEqual(observation.reason, "safety_obstacle")
+
+    def test_safety_envelope_requires_configured_consecutive_scans(self):
+        estimator = LidarParkingSpaceEstimator(
+            replace(self.make_estimator().config, safety_confirm_scans=3)
+        )
+        points = self.two_car_points() + (point_at(0.0, 500.0),)
+
+        first = estimator.estimate(LidarScan(1.0, points), now=1.0)
+        second = estimator.estimate(LidarScan(2.0, points), now=2.0)
+        third = estimator.estimate(LidarScan(3.0, points), now=3.0)
+
+        self.assertFalse(first.unsafe)
+        self.assertFalse(second.unsafe)
+        self.assertTrue(third.unsafe)
 
     def test_recording_csv_parser_groups_timestamp_scans(self):
         content = (

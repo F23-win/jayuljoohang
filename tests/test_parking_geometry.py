@@ -5,6 +5,7 @@ import numpy as np
 from skku_autocar.estimation.parking_geometry import (
     ParkingGeometry,
     ParkingGeometryConfig,
+    ParkingGeometryDepthStabilizer,
     ParkingGeometryEstimator,
     axial_angle_difference,
     filter_parking_car_masks,
@@ -114,6 +115,72 @@ class ParkingGeometryTest(unittest.TestCase):
         self.assertTrue(second.found)
         self.assertFalse(lost.found)
 
+    def test_jump_holds_previous_path_then_switches_after_five_frames(self):
+        estimator = self.make_estimator(
+            min_confirm_frames=3,
+            jump_reconfirm_frames=5,
+            max_jump_hold_frames=3,
+            max_lateral_jump_px=40.0,
+        )
+        old = None
+        for _ in range(3):
+            old = estimator.estimate(
+                [vertical_mask(160)],
+                confidence=1.0,
+                selection_mode="single_car_left",
+            )
+        self.assertTrue(old.found)
+
+        observations = [
+            estimator.estimate(
+                [vertical_mask(20)],
+                confidence=1.0,
+                selection_mode="single_car_left",
+            )
+            for _ in range(5)
+        ]
+
+        self.assertTrue(all(item.found and item.coasted for item in observations[:4]))
+        self.assertTrue(all("reconfirming_jump" in item.reason for item in observations[:4]))
+        self.assertTrue(observations[4].found)
+        self.assertFalse(observations[4].coasted)
+        self.assertNotEqual(observations[4].slot_center_x_px, old.slot_center_x_px)
+
+    def test_unstable_jump_stops_after_three_held_frames(self):
+        estimator = self.make_estimator(
+            min_confirm_frames=3,
+            jump_reconfirm_frames=5,
+            max_jump_hold_frames=3,
+            max_lateral_jump_px=40.0,
+        )
+        for _ in range(3):
+            confirmed = estimator.estimate(
+                [vertical_mask(160)],
+                confidence=1.0,
+                selection_mode="single_car_left",
+            )
+        self.assertTrue(confirmed.found)
+
+        results = [
+            estimator.estimate(
+                [vertical_mask(x)],
+                confidence=1.0,
+                selection_mode="single_car_left",
+            )
+            for x in (20, 180, 20, 180, 20)
+        ]
+
+        self.assertTrue(all(item.found and item.coasted for item in results[:4]))
+        self.assertFalse(results[4].found)
+
+    def test_heading_jump_is_symmetric_for_both_directions(self):
+        estimator = self.make_estimator(max_heading_jump_deg=35.0)
+        positive = ParkingGeometry(heading_error_deg=40.0)
+        negative = ParkingGeometry(heading_error_deg=-20.0)
+
+        self.assertTrue(estimator._is_jump(positive, negative))
+        self.assertTrue(estimator._is_jump(negative, positive))
+
     def test_axial_angle_wraps_at_180_degrees(self):
         self.assertAlmostEqual(axial_angle_difference(2.0, 178.0), 4.0)
 
@@ -173,7 +240,7 @@ class ParkingGeometryTest(unittest.TestCase):
         self.assertEqual(len(selected), 3)
         self.assertTrue(all(mask is expected for mask, expected in zip(selected, inside)))
 
-    def test_initial_single_yolo_car_restores_slot_on_its_left(self):
+    def test_first_yolo_car_always_anchors_virtual_slot_on_its_left(self):
         nearest_left = vertical_mask(10)
         right = [vertical_mask(60), vertical_mask(140)]
 
@@ -184,6 +251,17 @@ class ParkingGeometryTest(unittest.TestCase):
 
         self.assertEqual(mode, "single_car_left")
         self.assertEqual(selected, (nearest_left,))
+
+    def test_single_right_yolo_car_restores_slot_on_its_left(self):
+        lines = [vertical_mask(10), vertical_mask(60), vertical_mask(140)]
+
+        selected, mode = select_parking_line_masks(
+            lines,
+            [car_mask(150, 190)],
+        )
+
+        self.assertEqual(mode, "single_car_left")
+        self.assertEqual(selected, (lines[2],))
 
     def test_after_two_cars_single_survivor_restores_slot_on_its_right(self):
         estimator = self.make_estimator()
@@ -198,6 +276,32 @@ class ParkingGeometryTest(unittest.TestCase):
 
         self.assertEqual(mode, "single_car_right")
         self.assertEqual(selected, (lines[1],))
+
+    def test_confirmed_two_car_gap_is_coasted_before_survivor_fallback(self):
+        estimator = self.make_estimator(max_coast_frames=2)
+        lines = [vertical_mask(10), vertical_mask(60), vertical_mask(140)]
+        cars = [car_mask(10, 40), car_mask(160, 190)]
+
+        selected, mode = estimator.select_masks(lines, cars)
+        locked = estimator.estimate(selected, 1.0, mode, observed_car_count=2)
+        self.assertEqual(locked.selection_mode, "two_car")
+
+        selected, mode = estimator.select_masks(lines, [cars[0]])
+        first = estimator.estimate(selected, 1.0, mode, observed_car_count=1)
+        selected, mode = estimator.select_masks(lines, [cars[0]])
+        second = estimator.estimate(selected, 1.0, mode, observed_car_count=1)
+
+        self.assertTrue(first.coasted)
+        self.assertTrue(second.coasted)
+        self.assertEqual(first.selection_mode, "locked_gap_coast")
+        self.assertEqual(first.reason, "coast:locked_two_car_gap")
+
+        selected, mode = estimator.select_masks(lines, [cars[0]])
+        fallback = estimator.estimate(selected, 1.0, mode, observed_car_count=1)
+
+        self.assertEqual(mode, "single_car_right")
+        self.assertFalse(fallback.coasted)
+        self.assertEqual(fallback.selection_mode, "single_car_right")
 
     def test_single_car_boundary_builds_virtual_parallel_slot_edge(self):
         geometry = self.make_estimator().estimate(
@@ -234,6 +338,12 @@ class ParkingGeometryTest(unittest.TestCase):
 
         self.assertEqual(filter_parking_car_masks([person, car]), (car,))
 
+    def test_vehicle_mask_filter_keeps_wide_car_in_upper_camera_region(self):
+        car = np.zeros((200, 200), dtype=np.uint8)
+        car[20:48, 45:155] = 255
+
+        self.assertEqual(filter_parking_car_masks([car], 0.20), (car,))
+
     def test_camera_only_merge_uses_camera_vehicle_reference_for_depth(self):
         camera = self.make_estimator().estimate(
             [vertical_mask(110)],
@@ -247,11 +357,56 @@ class ParkingGeometryTest(unittest.TestCase):
         self.assertAlmostEqual(merged.depth_remaining_px, camera.depth_remaining_px)
 
     def test_camera_car_count_is_preserved_without_confirmed_geometry(self):
-        camera = ParkingGeometry(observed_car_count=1, reason="need_two_lines")
+        camera = ParkingGeometry(
+            observed_car_count=1,
+            observed_line_count=1,
+            reason="need_two_lines",
+        )
 
         merged = merge_camera_slot_guidance(ParkingGeometry(), camera)
 
         self.assertEqual(merged.observed_car_count, 1)
+        self.assertEqual(merged.observed_line_count, 1)
+
+    def test_final_depth_jump_is_held_until_reconfirmed(self):
+        stabilizer = ParkingGeometryDepthStabilizer(
+            max_jump_px=160.0,
+            reconfirm_frames=3,
+            candidate_tolerance_px=45.0,
+        )
+        accepted = ParkingGeometry(
+            found=True,
+            has_side_pair=True,
+            has_back_line=True,
+            depth_remaining_px=564.0,
+            stop_target_x_px=300.0,
+            stop_target_y_px=100.0,
+            selection_mode="single_car_left",
+            reason="locked_slot",
+        )
+        jumped = ParkingGeometry(
+            found=True,
+            has_side_pair=True,
+            has_back_line=True,
+            depth_remaining_px=318.0,
+            stop_target_x_px=50.0,
+            stop_target_y_px=500.0,
+            selection_mode="line_only",
+            reason="camera_back_line",
+        )
+
+        stabilizer.update(accepted)
+        first = stabilizer.update(jumped)
+        second = stabilizer.update(jumped)
+        third = stabilizer.update(jumped)
+
+        self.assertEqual(first.depth_remaining_px, 564.0)
+        self.assertEqual(second.depth_remaining_px, 564.0)
+        self.assertEqual(first.stop_target_x_px, 300.0)
+        self.assertEqual(first.selection_mode, "single_car_left")
+        self.assertTrue(first.coasted)
+        self.assertIn("depth_reconfirming:1/3", first.reason)
+        self.assertEqual(third.depth_remaining_px, 318.0)
 
     def test_car_selected_camera_lines_override_lidar_center_guidance(self):
         camera = self.make_estimator().estimate(

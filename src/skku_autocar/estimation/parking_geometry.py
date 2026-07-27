@@ -92,11 +92,82 @@ class ParkingGeometryConfig:
     virtual_back_y_ratio: float = 0.32
     min_geometry_confidence: float = 0.20
     min_confirm_frames: int = 3
+    jump_reconfirm_frames: int = 5
+    max_jump_hold_frames: int = 3
     max_coast_frames: int = 3
     smooth_alpha: float = 0.35
     max_lateral_jump_px: float = 90.0
     max_heading_jump_deg: float = 35.0
     max_depth_jump_px: float = 140.0
+    merged_depth_reconfirm_frames: int = 5
+    merged_depth_candidate_tolerance_px: float = 45.0
+
+
+class ParkingGeometryDepthStabilizer:
+    """Reconfirm large final back-line jumps after camera/LiDAR fusion."""
+
+    def __init__(
+        self,
+        max_jump_px: float = 140.0,
+        reconfirm_frames: int = 5,
+        candidate_tolerance_px: float = 45.0,
+    ):
+        self.max_jump_px = max(0.0, float(max_jump_px))
+        self.reconfirm_frames = max(1, int(reconfirm_frames))
+        self.candidate_tolerance_px = max(0.0, float(candidate_tolerance_px))
+        self._last: Optional[ParkingGeometry] = None
+        self._candidate_depth: Optional[float] = None
+        self._candidate_frames = 0
+
+    def reset(self) -> None:
+        self._last = None
+        self._candidate_depth = None
+        self._candidate_frames = 0
+
+    def update(self, geometry: ParkingGeometry) -> ParkingGeometry:
+        depth = geometry.depth_remaining_px
+        if not geometry.has_back_line or depth is None:
+            self._candidate_depth = None
+            self._candidate_frames = 0
+            return geometry
+        if self._last is None or self._last.depth_remaining_px is None:
+            self._accept(geometry)
+            return geometry
+        previous_depth = self._last.depth_remaining_px
+        if abs(depth - previous_depth) <= self.max_jump_px:
+            self._accept(geometry)
+            return geometry
+        if (
+            self._candidate_depth is None
+            or abs(depth - self._candidate_depth) > self.candidate_tolerance_px
+        ):
+            self._candidate_depth = depth
+            self._candidate_frames = 1
+        else:
+            self._candidate_depth = depth
+            self._candidate_frames += 1
+        if self._candidate_frames >= self.reconfirm_frames:
+            self._accept(geometry)
+            return geometry
+        previous = self._last
+        # Side direction and back target must come from one accepted frame.
+        # Mixing a new side pose with the held target can put it ahead of the car.
+        return replace(
+            previous,
+            observed_car_count=geometry.observed_car_count,
+            observed_line_count=geometry.observed_line_count,
+            coasted=True,
+            reason="%s|depth_reconfirming:%d/%d" % (
+                geometry.reason,
+                self._candidate_frames,
+                self.reconfirm_frames,
+            ),
+        )
+
+    def _accept(self, geometry: ParkingGeometry) -> None:
+        self._last = geometry
+        self._candidate_depth = None
+        self._candidate_frames = 0
 
 
 class ParkingGeometryEstimator:
@@ -113,6 +184,8 @@ class ParkingGeometryEstimator:
         self._confirm_frames = 0
         self._last: Optional[ParkingGeometry] = None
         self._coast_frames = 0
+        self._reconfirming = False
+        self._jump_hold_frames = 0
         self._seen_two_cars = False
         self._two_car_confirm_frames = 0
 
@@ -121,6 +194,8 @@ class ParkingGeometryEstimator:
         self._confirm_frames = 0
         self._last = None
         self._coast_frames = 0
+        self._reconfirming = False
+        self._jump_hold_frames = 0
         self._seen_two_cars = False
         self._two_car_confirm_frames = 0
 
@@ -139,6 +214,30 @@ class ParkingGeometryEstimator:
         )
         if self._two_car_confirm_frames >= max(1, self.config.min_confirm_frames):
             self._seen_two_cars = True
+
+        locked_two_car_gap = (
+            self._seen_two_cars
+            and len(car_masks) < 2
+            and self._last is not None
+            and self._last.selection_mode in (
+                "two_car",
+                "two_car_left_line",
+                "two_car_right_line",
+            )
+        )
+        if locked_two_car_gap and self._coast_frames < self.config.max_coast_frames:
+            # Do not rebuild a stable two-car bay from a one-frame YOLO dropout.
+            # Returning no masks makes estimate() coast the last locked geometry.
+            return (), "locked_gap_coast"
+        if locked_two_car_gap:
+            # The dropout outlived the hold window.  Forget the stale bay before
+            # accepting the survivor-based fallback selected above.
+            self._candidate = None
+            self._confirm_frames = 0
+            self._last = None
+            self._coast_frames = 0
+            self._reconfirming = False
+            self._jump_hold_frames = 0
         return selected, mode
 
     def estimate(
@@ -163,33 +262,77 @@ class ParkingGeometryEstimator:
                     confidence=self._last.confidence * decay,
                     observed_car_count=raw.observed_car_count,
                     coasted=True,
-                    reason="coast:%s" % raw.reason,
+                    selection_mode=(
+                        "locked_gap_coast"
+                        if selection_mode == "locked_gap_coast"
+                        else self._last.selection_mode
+                    ),
+                    reason=(
+                        "coast:locked_two_car_gap"
+                        if selection_mode == "locked_gap_coast"
+                        else "coast:%s" % raw.reason
+                    ),
                 )
             self._last = None
             self._coast_frames = 0
+            self._reconfirming = False
+            self._jump_hold_frames = 0
             return raw
 
-        if self._candidate is None or self._is_jump(self._candidate, raw):
+        jumped = self._candidate is None or self._is_jump(self._candidate, raw)
+        if jumped:
+            if self._last is not None:
+                if self._reconfirming:
+                    self._jump_hold_frames += 1
+                else:
+                    self._reconfirming = True
             self._candidate = raw
             self._confirm_frames = 1
         else:
             self._candidate = raw
             self._confirm_frames += 1
 
-        if self._confirm_frames < max(1, self.config.min_confirm_frames):
+        required_frames = max(
+            1,
+            self.config.jump_reconfirm_frames
+            if self._reconfirming
+            else self.config.min_confirm_frames,
+        )
+        if self._confirm_frames < required_frames:
+            if self._last is not None and self._reconfirming:
+                if not jumped:
+                    self._jump_hold_frames += 1
+                if self._jump_hold_frames <= max(
+                    0,
+                    self.config.max_jump_hold_frames,
+                ):
+                    return replace(
+                        self._last,
+                        observed_car_count=raw.observed_car_count,
+                        coasted=True,
+                        reason="coast:reconfirming_jump:%d/%d hold=%d/%d"
+                        % (
+                            self._confirm_frames,
+                            required_frames,
+                            self._jump_hold_frames,
+                            max(0, self.config.max_jump_hold_frames),
+                        ),
+                    )
             return replace(
                 raw,
                 found=False,
-                confidence=raw.confidence * self._confirm_frames / max(1, self.config.min_confirm_frames),
+                confidence=raw.confidence * self._confirm_frames / required_frames,
                 reason="confirming:%d/%d" % (
                     self._confirm_frames,
-                    max(1, self.config.min_confirm_frames),
+                    required_frames,
                 ),
             )
 
         result = self._smooth(self._last, raw)
         self._last = result
         self._coast_frames = 0
+        self._reconfirming = False
+        self._jump_hold_frames = 0
         return result
 
     def _estimate_raw(
@@ -606,7 +749,7 @@ class ParkingGeometryEstimator:
         if abs(current.lateral_error_px - previous.lateral_error_px) > self.config.max_lateral_jump_px:
             return True
         if (
-            axial_signed_difference(current.heading_error_deg, previous.heading_error_deg)
+            abs(axial_signed_difference(current.heading_error_deg, previous.heading_error_deg))
             > self.config.max_heading_jump_deg
         ):
             return True
@@ -621,7 +764,7 @@ def select_parking_line_masks(
     car_masks: Sequence[Any],
     after_two_cars: bool = False,
 ) -> Tuple[Tuple[Any, ...], str]:
-    """Select a real gap, then recover it from the surviving left car."""
+    """Select a virtual left bay until a real two-car gap is confirmed."""
 
     lines = tuple(line_masks)
     if len(lines) == 0 or len(car_masks) == 0:
@@ -664,10 +807,15 @@ def select_parking_line_masks(
 
     if len(cars) == 1:
         car_center = (cars[0][0] + cars[0][1]) / 2.0
+        # Before a two-car gap is known, the first car always anchors a virtual
+        # bay on its left.  Keep that identity even while it traverses the image.
+        # After a real gap was seen, use screen position only as a long-dropout
+        # survivor fallback: left survivor -> gap right, right survivor -> gap left.
+        slot_is_right_of_car = after_two_cars and car_center <= image_center
         candidates = [
             (anchor, mask)
             for anchor, mask in line_anchors
-            if (anchor > car_center) == after_two_cars
+            if (anchor > car_center) == slot_is_right_of_car
         ]
         if candidates:
             anchor, mask = min(
@@ -675,13 +823,16 @@ def select_parking_line_masks(
                 key=lambda item: abs(item[0] - car_center),
             )
             return (mask,) + _perpendicular_line_masks(mask, lines), (
-                "single_car_right" if after_two_cars else "single_car_left"
+                "single_car_right" if slot_is_right_of_car else "single_car_left"
             )
 
     return lines, "line_only"
 
 
-def filter_parking_car_masks(car_masks: Sequence[Any]) -> Tuple[Any, ...]:
+def filter_parking_car_masks(
+    car_masks: Sequence[Any],
+    min_bottom_ratio: float = 0.20,
+) -> Tuple[Any, ...]:
     """Keep road-level, car-shaped masks and reject upright people."""
 
     import numpy as np
@@ -693,7 +844,10 @@ def filter_parking_car_masks(car_masks: Sequence[Any]) -> Tuple[Any, ...]:
             continue
         width = float(xs.max() - xs.min() + 1)
         height = float(ys.max() - ys.min() + 1)
-        if width < height * 1.05 or ys.max() < mask.shape[0] * 0.45:
+        if (
+            width < height * 1.05
+            or ys.max() < mask.shape[0] * min(1.0, max(0.0, min_bottom_ratio))
+        ):
             continue
         result.append(mask)
     return tuple(result)
@@ -793,6 +947,7 @@ def merge_camera_slot_guidance(
     merged = replace(
         merge_camera_back_line(geometry, camera_geometry),
         observed_car_count=camera_geometry.observed_car_count,
+        observed_line_count=camera_geometry.observed_line_count,
     )
     if (
         not camera_geometry.found

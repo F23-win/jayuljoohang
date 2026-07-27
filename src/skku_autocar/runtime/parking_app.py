@@ -10,7 +10,7 @@ from dataclasses import replace
 from datetime import datetime
 from math import cos, isfinite, radians, sin
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Sequence, Tuple
 
 from ..control.serial_vehicle import (
     SerialVehicleClient,
@@ -27,6 +27,7 @@ from ..estimation.locked_slot import (
 from ..estimation.lidar_slot_geometry import LidarSlotGeometryProjector
 from ..estimation.parking_geometry import (
     ParkingGeometry,
+    ParkingGeometryDepthStabilizer,
     ParkingGeometryEstimator,
     filter_parking_car_masks,
     merge_camera_back_line,
@@ -35,6 +36,7 @@ from ..estimation.parking_geometry import (
 from ..estimation.parking_lidar import (
     LidarParkingObservation,
     LidarParkingSpaceEstimator,
+    first_car_bearing_from_forward_deg,
     infer_dynamic_slot_polygon,
 )
 from ..parking_config import ParkingAppConfig, load_parking_config
@@ -77,6 +79,21 @@ def validate_parking_model(segmenter: YoloLaneSegmenter) -> None:
             "loaded classes=%s. Use trained_model/0725best.pt"
             % sorted(segmenter.names.values())
         )
+
+
+def filter_bev_visible_line_masks(
+    transformer: BevTransformer,
+    line_masks: Sequence[Any],
+    min_pixels: int,
+) -> Tuple[Any, ...]:
+    """Discard lines outside the calibrated BEV before car-relative selection."""
+
+    required_pixels = max(1, int(min_pixels))
+    return tuple(
+        mask
+        for mask in line_masks
+        if int((transformer.warp_mask(mask) > 0).sum()) >= required_pixels
+    )
 
 
 class DashboardVideoRecorder:
@@ -296,6 +313,11 @@ def run_prepared(args: argparse.Namespace) -> int:
         validate_parking_model(segmenter)
     transformer = BevTransformer(config.bev)
     geometry_estimator = ParkingGeometryEstimator(config.geometry)
+    depth_stabilizer = ParkingGeometryDepthStabilizer(
+        max_jump_px=config.geometry.max_depth_jump_px,
+        reconfirm_frames=config.geometry.merged_depth_reconfirm_frames,
+        candidate_tolerance_px=config.geometry.merged_depth_candidate_tolerance_px,
+    )
     lidar_estimator = LidarParkingSpaceEstimator(config.lidar)
     locked_slot_geometry = make_locked_slot_geometry(config)
     planner = TParkingPlanner(config.planner, config.path)
@@ -441,9 +463,19 @@ def run_prepared(args: argparse.Namespace) -> int:
 
             if segmenter is not None:
                 class_masks = segmenter.segment_class_masks(frame)
-                yolo_car_masks = list(filter_parking_car_masks(class_masks.car))
-                selected_masks, selection_mode = geometry_estimator.select_masks(
+                yolo_car_masks = list(
+                    filter_parking_car_masks(
+                        class_masks.car,
+                        config.yolo.car_min_bottom_ratio,
+                    )
+                )
+                visible_line_masks = filter_bev_visible_line_masks(
+                    transformer,
                     class_masks.lane,
+                    config.geometry.min_line_pixels,
+                )
+                selected_masks, selection_mode = geometry_estimator.select_masks(
+                    visible_line_masks,
                     yolo_car_masks,
                 )
                 parking_masks = list(selected_masks)
@@ -487,6 +519,7 @@ def run_prepared(args: argparse.Namespace) -> int:
                 if planner.state in CAMERA_GUIDED_STATES
                 else merge_camera_back_line(geometry, camera_geometry)
             )
+            geometry = depth_stabilizer.update(geometry)
             ultrasonic_fresh = (
                 last_ultrasonic is not None
                 and monotonic_now - last_ultrasonic_at
@@ -516,6 +549,7 @@ def run_prepared(args: argparse.Namespace) -> int:
             )
             if plan.reason == "start_forward_rollout":
                 geometry_estimator.reset()
+                depth_stabilizer.reset()
                 lidar_estimator.reset()
                 locked_slot_geometry.reset()
                 locked_slot_pose = LockedSlotPose()
@@ -623,6 +657,7 @@ def run_prepared(args: argparse.Namespace) -> int:
                 ):
                     planner.start(elapsed)
                     geometry_estimator.reset()
+                    depth_stabilizer.reset()
                     lidar_estimator.reset()
                     locked_slot_geometry.reset()
                     locked_slot_pose = LockedSlotPose()
@@ -632,6 +667,7 @@ def run_prepared(args: argparse.Namespace) -> int:
             elif key == ord("r"):
                 planner.reset(elapsed)
                 geometry_estimator.reset()
+                depth_stabilizer.reset()
                 lidar_estimator.reset()
                 locked_slot_geometry.reset()
                 locked_slot_pose = LockedSlotPose()
@@ -856,19 +892,20 @@ def draw_live_dashboard(
             format_dashboard_value(center_cm, signed=True),
             format_dashboard_value(width_cm),
         ),
-        "FIRST CORNER y=%s cm targetErr=%s cm turn=%s" % (
+        "FIRST CORNER y=%s cm bearing=%s deg pair=%s turn=%s" % (
             format_dashboard_value(
                 None
                 if lidar.first_car_slot_edge_y_back_mm is None
                 else lidar.first_car_slot_edge_y_back_mm / 10.0,
                 signed=True,
             ),
-            format_dashboard_value(
-                None
-                if lidar.first_car_turn_error_mm is None
-                else lidar.first_car_turn_error_mm / 10.0,
-                signed=True,
-            ),
+            format_dashboard_value(first_car_bearing_from_forward_deg(lidar)),
+            "FRESH" if (
+                lidar.gap_confirmed
+                and lidar.gap_pair_observed
+                and lidar.car_count >= 2
+                and not lidar.coasted
+            ) else "NO",
             "READY" if lidar.first_car_turn_reached else "waiting",
         ),
         "LOCKED SLOT inside=%.0f%% full=%s conf=%.2f lat=%+.2f head=%+.1f depth=%s (%s)" % (
@@ -990,9 +1027,17 @@ def draw_debug(
         display[selected] = (0.55 * display[selected] + 0.45 * color).astype(np.uint8)
     cv2.putText(
         display,
-        "YOLO cars=%d slot=%s" % (
+        "YOLO cars=%d slot=%s cam=%s path=%s" % (
             len(car_masks or []),
             mask_roles.selection_mode,
+            mask_roles.reason,
+            (
+                "HOLD"
+                if mask_roles.coasted
+                else "LIVE"
+                if mask_roles.found
+                else "RECHECK"
+            ),
         ),
         (18, max(25, display.shape[0] - 18)),
         cv2.FONT_HERSHEY_SIMPLEX,
@@ -1018,15 +1063,14 @@ def draw_debug(
     vehicle_x = int(width / 2)
     cv2.line(bev_display, (vehicle_x, 0), (vehicle_x, height - 1), (90, 90, 90), 1)
     cv2.circle(bev_display, (vehicle_x, int(height * 0.95)), 7, (255, 255, 255), -1)
-    guidance_geometry = (
-        mask_roles
-        if mask_roles.found and mask_roles.has_side_pair
-        else geometry
-    )
+    # Use the merged control geometry here too; camera-only status remains in
+    # the YOLO footer on the rear image.
+    guidance_geometry = geometry
     draw_parking_line(cv2, bev_display, guidance_geometry.left, (0, 200, 255))
     draw_parking_line(cv2, bev_display, guidance_geometry.right, (255, 200, 0))
     draw_parking_line(cv2, bev_display, guidance_geometry.back, (180, 0, 180))
     draw_parking_centerline(cv2, bev_display, guidance_geometry)
+    draw_parking_goal_status(cv2, bev_display, guidance_geometry)
     draw_bev_maneuver_path(cv2, np, bev_display, plan, guidance_geometry)
 
     depth = "-" if geometry.depth_remaining_px is None else "%.1fpx" % geometry.depth_remaining_px
@@ -1764,6 +1808,68 @@ def draw_parking_centerline(cv2: Any, image: Any, geometry: ParkingGeometry) -> 
         int(round(geometry.slot_center_y_px + direction[1] * height)),
     )
     cv2.line(image, first, second, (0, 0, 255), 2, cv2.LINE_AA)
+
+
+def parking_slot_mode_label(selection_mode: str) -> str:
+    return {
+        "single_car_left": "VIRTUAL_LEFT_OF_CAR",
+        "single_car_right": "VIRTUAL_RIGHT_OF_CAR",
+        "two_car": "BETWEEN_TWO_CARS",
+        "two_car_left_line": "BETWEEN_TWO_CARS",
+        "two_car_right_line": "BETWEEN_TWO_CARS",
+        "locked_gap_coast": "LOCKED_GAP_COAST",
+    }.get(selection_mode, selection_mode.upper())
+
+
+def parking_goal_visibility(geometry: ParkingGeometry, image_width: int) -> str:
+    if geometry.slot_center_x_px is None:
+        return "UNKNOWN"
+    if geometry.slot_center_x_px < 0:
+        return "OFFSCREEN_LEFT"
+    if geometry.slot_center_x_px >= image_width:
+        return "OFFSCREEN_RIGHT"
+    return "VISIBLE"
+
+
+def draw_parking_goal_status(
+    cv2: Any,
+    image: Any,
+    geometry: ParkingGeometry,
+) -> None:
+    width = image.shape[1]
+    mode = parking_slot_mode_label(geometry.selection_mode)
+    visibility = parking_goal_visibility(geometry, width)
+    cv2.putText(
+        image,
+        "SLOT: %s" % mode,
+        (10, 44),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.43,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        image,
+        "GOAL: %s" % visibility,
+        (10, 64),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.43,
+        (0, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    if visibility == "OFFSCREEN_LEFT":
+        cv2.arrowedLine(image, (52, 82), (8, 82), (0, 255, 255), 2, tipLength=0.3)
+    elif visibility == "OFFSCREEN_RIGHT":
+        cv2.arrowedLine(
+            image,
+            (width - 52, 82),
+            (width - 8, 82),
+            (0, 255, 255),
+            2,
+            tipLength=0.3,
+        )
 
 
 def draw_bev_maneuver_path(

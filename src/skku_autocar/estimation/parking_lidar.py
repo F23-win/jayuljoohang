@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import cos, hypot, radians, sin, sqrt
+from math import atan2, cos, degrees, hypot, radians, sin, sqrt
 from typing import List, Optional, Sequence, Tuple
 
 from ..sensors.lidar import LidarPoint, LidarScan
@@ -71,6 +71,7 @@ class LidarParkingConfig:
     slot_tracking_roi: Optional[RectangleRoi] = RectangleRoi(-1800.0, 2600.0, -2500.0, 2500.0)
     # Separate collision envelope used while reversing.
     safety_roi: RectangleRoi = RectangleRoi(-300.0, 300.0, 100.0, 450.0)
+    safety_confirm_scans: int = 1
     min_observed_points: int = 5
     car_cluster_radius_mm: float = 350.0
     car_cluster_min_points: int = 2
@@ -121,6 +122,10 @@ class LidarParkingConfig:
     # 0 is level with the LiDAR; negative turns earlier, positive turns later.
     first_car_confirm_scans: int = 2
     first_car_min_x_right_mm: float = 250.0
+    # The first parked car may be as far as 2 m to the right, but an obstacle
+    # already well behind the LiDAR at mission start must not arm a left turn.
+    first_car_max_x_right_mm: float = 2200.0
+    first_car_acquire_y_back_max_mm: float = 350.0
     first_car_turn_target_y_back_mm: float = 0.0
     # A parked car presents a dense, straight body panel to the LiDAR. A person
     # standing beside the vehicle returns a sparse, rounded (low-linearity)
@@ -177,6 +182,18 @@ class LidarParkingObservation:
     reason: str = "no_scan"
 
 
+def first_car_bearing_from_forward_deg(
+    observation: LidarParkingObservation,
+) -> Optional[float]:
+    """Bearing from LiDAR forward: front=0, right=90, rear=180 degrees."""
+
+    x_right = observation.first_car_slot_edge_x_right_mm
+    y_back = observation.first_car_slot_edge_y_back_mm
+    if x_right is None or y_back is None:
+        return None
+    return degrees(atan2(x_right, -y_back)) % 360.0
+
+
 class LidarParkingSpaceEstimator:
     """Find a bay from the two parked cars that border it.
 
@@ -190,6 +207,7 @@ class LidarParkingSpaceEstimator:
         self.config = config
         self._last_timestamp: Optional[float] = None
         self._first_car_confirm_scans = 0
+        self._first_car_seen_ahead = False
         self._candidate_center_x_mm: Optional[float] = None
         self._candidate_center_mm: Optional[float] = None
         self._last_candidate_timestamp: Optional[float] = None
@@ -207,10 +225,12 @@ class LidarParkingSpaceEstimator:
         self._last_gap: Optional[
             Tuple[float, float, float, float, float, float, float]
         ] = None
+        self._unsafe_scans = 0
 
     def reset(self) -> None:
         self._last_timestamp = None
         self._first_car_confirm_scans = 0
+        self._first_car_seen_ahead = False
         self._candidate_center_x_mm = None
         self._candidate_center_mm = None
         self._last_candidate_timestamp = None
@@ -226,6 +246,7 @@ class LidarParkingSpaceEstimator:
         self._smoothed_edge_span_mm = None
         self._smoothed_gap_width_mm = None
         self._last_gap = None
+        self._unsafe_scans = 0
 
     def vehicle_points(self, scan: Optional[LidarScan]) -> List[Tuple[float, float]]:
         if scan is None:
@@ -264,13 +285,16 @@ class LidarParkingSpaceEstimator:
             (summarize_cluster(points) for points in cluster_points_list),
             key=lambda cluster: cluster.y_back_min_mm,
         ))
+        new_scan = self._last_timestamp != scan.timestamp
         safety_distances = [
             hypot(x_right, y_back)
             for x_right, y_back in transformed
             if self.config.safety_roi.contains(x_right, y_back)
         ]
         nearest_safety = min(safety_distances) if safety_distances else None
-        unsafe = nearest_safety is not None
+        if new_scan:
+            self._unsafe_scans = self._unsafe_scans + 1 if nearest_safety is not None else 0
+        unsafe = self._unsafe_scans >= max(1, self.config.safety_confirm_scans)
         valid = (
             len(transformed) >= max(1, self.config.min_observed_points)
             or len(car_points) >= max(1, self.config.car_cluster_min_points)
@@ -303,14 +327,18 @@ class LidarParkingSpaceEstimator:
         gap_pair_observed = candidate is not None
         if candidate is None and valid and self._confirmed:
             candidate = self._track_gap_from_single_cluster(clusters)
-        new_scan = self._last_timestamp != scan.timestamp
-
         first_car = select_first_approach_car(clusters, self.config) if valid else None
         if new_scan:
             if first_car is None:
                 self._first_car_confirm_scans = 0
+                self._first_car_seen_ahead = False
             else:
                 self._first_car_confirm_scans += 1
+                if (
+                    first_car.y_back_min_mm
+                    <= self.config.first_car_turn_target_y_back_mm
+                ):
+                    self._first_car_seen_ahead = True
         first_car_confirmed = (
             first_car is not None
             and self._first_car_confirm_scans
@@ -333,6 +361,7 @@ class LidarParkingSpaceEstimator:
         )
         first_car_turn_reached = (
             first_car_confirmed
+            and self._first_car_seen_ahead
             and first_car_turn_error is not None
             and first_car_turn_error <= 0.0
         )
@@ -738,12 +767,22 @@ def select_first_approach_car(
     candidates = [
         cluster
         for cluster in clusters
-        if cluster.center_x_right_mm >= config.first_car_min_x_right_mm
+        if (
+            config.first_car_min_x_right_mm
+            <= cluster.center_x_right_mm
+            <= config.first_car_max_x_right_mm
+        )
+        and cluster.y_back_min_mm <= config.first_car_acquire_y_back_max_mm
         and is_first_car_eligible(cluster, config)
     ]
     if not candidates:
         return None
-    return max(candidates, key=lambda cluster: cluster.center_y_back_mm)
+    return min(
+        candidates,
+        key=lambda cluster: abs(
+            cluster.center_y_back_mm - config.first_car_turn_target_y_back_mm
+        ),
+    )
 
 
 def is_first_car_eligible(cluster: CarCluster, config: LidarParkingConfig) -> bool:
