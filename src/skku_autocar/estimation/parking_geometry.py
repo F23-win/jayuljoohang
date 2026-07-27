@@ -68,7 +68,9 @@ class ParkingGeometry:
     vehicle_fully_inside: bool = False
     confidence: float = 0.0
     observed_line_count: int = 0
+    observed_car_count: int = 0
     coasted: bool = False
+    selection_mode: str = "line_only"
     reason: str = "not_found"
 
 
@@ -87,6 +89,7 @@ class ParkingGeometryConfig:
     vehicle_reference_y_ratio: float = 0.95
     control_target_y_ratio: float = 0.70
     desired_back_clearance_px: float = 50.0
+    virtual_back_y_ratio: float = 0.32
     min_geometry_confidence: float = 0.20
     min_confirm_frames: int = 3
     max_coast_frames: int = 3
@@ -110,19 +113,45 @@ class ParkingGeometryEstimator:
         self._confirm_frames = 0
         self._last: Optional[ParkingGeometry] = None
         self._coast_frames = 0
+        self._seen_two_cars = False
+        self._two_car_confirm_frames = 0
 
     def reset(self) -> None:
         self._candidate = None
         self._confirm_frames = 0
         self._last = None
         self._coast_frames = 0
+        self._seen_two_cars = False
+        self._two_car_confirm_frames = 0
+
+    def select_masks(
+        self,
+        line_masks: Sequence[Any],
+        car_masks: Sequence[Any],
+    ) -> Tuple[Tuple[Any, ...], str]:
+        selected, mode = select_parking_line_masks(
+            line_masks,
+            car_masks,
+            after_two_cars=self._seen_two_cars,
+        )
+        self._two_car_confirm_frames = (
+            self._two_car_confirm_frames + 1 if mode == "two_car" else 0
+        )
+        if self._two_car_confirm_frames >= max(1, self.config.min_confirm_frames):
+            self._seen_two_cars = True
+        return selected, mode
 
     def estimate(
         self,
         masks: Sequence[Any],
         confidence: float = 1.0,
+        selection_mode: str = "line_only",
+        observed_car_count: int = 0,
     ) -> ParkingGeometry:
-        raw = self._estimate_raw(masks, confidence)
+        raw = replace(
+            self._estimate_raw(masks, confidence, selection_mode),
+            observed_car_count=max(0, observed_car_count),
+        )
         if not raw.found:
             self._candidate = None
             self._confirm_frames = 0
@@ -132,6 +161,7 @@ class ParkingGeometryEstimator:
                 return replace(
                     self._last,
                     confidence=self._last.confidence * decay,
+                    observed_car_count=raw.observed_car_count,
                     coasted=True,
                     reason="coast:%s" % raw.reason,
                 )
@@ -162,7 +192,12 @@ class ParkingGeometryEstimator:
         self._coast_frames = 0
         return result
 
-    def _estimate_raw(self, masks: Sequence[Any], detection_confidence: float) -> ParkingGeometry:
+    def _estimate_raw(
+        self,
+        masks: Sequence[Any],
+        detection_confidence: float,
+        selection_mode: str,
+    ) -> ParkingGeometry:
         lines = [
             line
             for line in (
@@ -172,6 +207,60 @@ class ParkingGeometryEstimator:
             if line is not None
         ]
         line_count = len(lines)
+        if lines and selection_mode in (
+            "single_car_left",
+            "single_car_right",
+            "two_car_left_line",
+            "two_car_right_line",
+        ):
+            anchor = lines[0]
+            if abs(anchor.direction_y) < 0.55:
+                anchor = replace(
+                    anchor,
+                    direction_x=0.0,
+                    direction_y=-1.0,
+                    length_px=max(anchor.length_px, self._shape[0] * 0.65),
+                )
+            left, right = self._virtual_pair(anchor, selection_mode)
+            best_back = None
+            best_back_score = -1.0
+            for candidate in lines[1:]:
+                perpendicular_error = abs(
+                    90.0 - axial_angle_difference(anchor.angle_deg, candidate.angle_deg)
+                )
+                if perpendicular_error > self.config.perpendicular_tolerance_deg:
+                    continue
+                left_corner = line_intersection(left, candidate)
+                right_corner = line_intersection(right, candidate)
+                if left_corner is None or right_corner is None:
+                    continue
+                support_count = sum(
+                    (
+                        left.supports(left_corner, self.config.intersection_margin_px),
+                        right.supports(right_corner, self.config.intersection_margin_px),
+                        candidate.supports(left_corner, self.config.intersection_margin_px),
+                        candidate.supports(right_corner, self.config.intersection_margin_px),
+                    )
+                )
+                if support_count < 3:
+                    continue
+                score = candidate.quality + support_count / 4.0
+                if score > best_back_score:
+                    best_back = candidate
+                    best_back_score = score
+            if best_back is None:
+                best_back = self._virtual_back(left, right, anchor)
+            return self._build_geometry(
+                left,
+                right,
+                (anchor.direction_x, anchor.direction_y),
+                self.config.expected_slot_width_px,
+                detection_confidence,
+                0.80,
+                line_count,
+                selection_mode,
+                back=best_back,
+            )
         if line_count < 2:
             return ParkingGeometry(observed_line_count=line_count, reason="need_two_lines")
 
@@ -265,19 +354,52 @@ class ParkingGeometryEstimator:
                 detection_confidence,
                 topology_score,
                 line_count,
+                selection_mode,
                 back=back,
             )
 
         pair_score, first_index, second_index, direction, separation = pair_candidates[0]
+        first = lines[first_index]
+        second = lines[second_index]
         return self._build_geometry(
-            lines[first_index],
-            lines[second_index],
+            first,
+            second,
             direction,
             separation,
             detection_confidence,
             pair_score * 0.65,
             line_count,
-            back=None,
+            selection_mode,
+            back=self._virtual_back(first, second, first),
+        )
+
+    def _virtual_pair(
+        self,
+        line: ParkingLine,
+        selection_mode: str,
+    ) -> Tuple[ParkingLine, ParkingLine]:
+        right_dx = -line.direction_y * self.config.expected_slot_width_px
+        right_dy = line.direction_x * self.config.expected_slot_width_px
+        if selection_mode in ("single_car_left", "two_car_right_line"):
+            return replace(line, center_x=line.center_x - right_dx, center_y=line.center_y - right_dy, mask_index=-1), line
+        return line, replace(line, center_x=line.center_x + right_dx, center_y=line.center_y + right_dy, mask_index=-1)
+
+    def _virtual_back(
+        self,
+        left: ParkingLine,
+        right: ParkingLine,
+        anchor: ParkingLine,
+    ) -> ParkingLine:
+        return ParkingLine(
+            center_x=(left.center_x + right.center_x) / 2.0,
+            center_y=self._shape[0] * self.config.virtual_back_y_ratio,
+            direction_x=-anchor.direction_y,
+            direction_y=anchor.direction_x,
+            length_px=self.config.expected_slot_width_px * 1.25,
+            residual_px=0.0,
+            quality=min(left.quality, right.quality) * 0.85,
+            point_count=0,
+            mask_index=-1,
         )
 
     def _build_geometry(
@@ -289,6 +411,7 @@ class ParkingGeometryEstimator:
         detection_confidence: float,
         topology_score: float,
         line_count: int,
+        selection_mode: str,
         back: Optional[ParkingLine],
     ) -> ParkingGeometry:
         import numpy as np
@@ -379,6 +502,7 @@ class ParkingGeometryEstimator:
             stop_target_y_px=stop_target_y,
             confidence=confidence,
             observed_line_count=line_count,
+            selection_mode=selection_mode,
             reason=(
                 ("parking_bay" if back is not None else "side_pair")
                 if found
@@ -492,6 +616,146 @@ class ParkingGeometryEstimator:
         return False
 
 
+def select_parking_line_masks(
+    line_masks: Sequence[Any],
+    car_masks: Sequence[Any],
+    after_two_cars: bool = False,
+) -> Tuple[Tuple[Any, ...], str]:
+    """Select a real gap, then recover it from the surviving left car."""
+
+    lines = tuple(line_masks)
+    if len(lines) == 0 or len(car_masks) == 0:
+        return lines, "line_only"
+
+    car_bounds = [bounds for mask in car_masks if (bounds := _mask_x_bounds(mask))]
+    line_anchors = [(_mask_top_anchor_x(mask), mask) for mask in lines]
+    line_anchors = [(anchor, mask) for anchor, mask in line_anchors if anchor is not None]
+    if not car_bounds or not line_anchors:
+        return lines, "line_only"
+
+    image_width = int(getattr(lines[0], "shape", (0, 0))[1])
+    image_center = image_width / 2.0
+    cars = sorted(car_bounds, key=lambda bounds: (bounds[0] + bounds[1]) / 2.0)
+
+    if len(cars) >= 2:
+        candidates = []
+        for left_car, right_car in zip(cars, cars[1:]):
+            left_center = (left_car[0] + left_car[1]) / 2.0
+            right_center = (right_car[0] + right_car[1]) / 2.0
+            selected = tuple(
+                (anchor, mask)
+                for anchor, mask in line_anchors
+                if left_center <= anchor <= right_center
+            )
+            if selected:
+                gap_center = (left_car[1] + right_car[0]) / 2.0
+                candidates.append((abs(gap_center - image_center), gap_center, selected))
+        if candidates:
+            _, gap_center, selected = min(candidates, key=lambda item: item[0])
+            masks = tuple(mask for _, mask in selected)
+            if _has_parallel_mask_pair(masks):
+                return masks, "two_car"
+            anchor, mask = min(selected, key=lambda item: abs(item[0] - gap_center))
+            return (mask,) + _perpendicular_line_masks(mask, lines), (
+                "two_car_left_line"
+                if anchor <= gap_center
+                else "two_car_right_line"
+            )
+
+    if len(cars) == 1:
+        car_center = (cars[0][0] + cars[0][1]) / 2.0
+        candidates = [
+            (anchor, mask)
+            for anchor, mask in line_anchors
+            if (anchor > car_center) == after_two_cars
+        ]
+        if candidates:
+            anchor, mask = min(
+                candidates,
+                key=lambda item: abs(item[0] - car_center),
+            )
+            return (mask,) + _perpendicular_line_masks(mask, lines), (
+                "single_car_right" if after_two_cars else "single_car_left"
+            )
+
+    return lines, "line_only"
+
+
+def filter_parking_car_masks(car_masks: Sequence[Any]) -> Tuple[Any, ...]:
+    """Keep road-level, car-shaped masks and reject upright people."""
+
+    import numpy as np
+
+    result = []
+    for mask in car_masks:
+        ys, xs = np.nonzero(mask)
+        if len(xs) == 0:
+            continue
+        width = float(xs.max() - xs.min() + 1)
+        height = float(ys.max() - ys.min() + 1)
+        if width < height * 1.05 or ys.max() < mask.shape[0] * 0.45:
+            continue
+        result.append(mask)
+    return tuple(result)
+
+
+def _perpendicular_line_masks(anchor: Any, masks: Sequence[Any]) -> Tuple[Any, ...]:
+    anchor_angle = _mask_axis_angle_deg(anchor)
+    if anchor_angle is None:
+        return ()
+    result = []
+    for mask in masks:
+        if mask is anchor:
+            continue
+        angle = _mask_axis_angle_deg(mask)
+        if angle is not None and abs(90.0 - axial_angle_difference(anchor_angle, angle)) <= 35.0:
+            result.append(mask)
+    return tuple(result)
+
+
+def _has_parallel_mask_pair(masks: Sequence[Any]) -> bool:
+    angles = [angle for mask in masks if (angle := _mask_axis_angle_deg(mask)) is not None]
+    return any(
+        axial_angle_difference(first, second) <= 35.0
+        for index, first in enumerate(angles[:-1])
+        for second in angles[index + 1 :]
+    )
+
+
+def _mask_axis_angle_deg(mask: Any) -> Optional[float]:
+    import numpy as np
+
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 2:
+        return None
+    points = np.column_stack((xs.astype(float), ys.astype(float)))
+    center = np.mean(points, axis=0)
+    covariance = np.cov(points - center, rowvar=False)
+    values, vectors = np.linalg.eigh(covariance)
+    direction = vectors[:, int(np.argmax(values))]
+    return degrees(atan2(float(direction[1]), float(direction[0]))) % 180.0
+
+
+def _mask_x_bounds(mask: Any) -> Optional[Tuple[float, float]]:
+    import numpy as np
+
+    _, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    return float(xs.min()), float(xs.max())
+
+
+def _mask_top_anchor_x(mask: Any) -> Optional[float]:
+    import numpy as np
+
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    top = float(np.percentile(ys, 10.0))
+    band = xs[ys <= top + max(2.0, mask.shape[0] * 0.04)]
+    return float(np.median(band if len(band) else xs))
+
+
 def merge_camera_back_line(
     geometry: ParkingGeometry,
     camera_geometry: ParkingGeometry,
@@ -517,6 +781,114 @@ def merge_camera_back_line(
         back_center_y_px=camera_geometry.back_center_y_px,
         stop_target_x_px=camera_geometry.stop_target_x_px,
         stop_target_y_px=camera_geometry.stop_target_y_px,
+    )
+
+
+def merge_camera_slot_guidance(
+    geometry: ParkingGeometry,
+    camera_geometry: ParkingGeometry,
+) -> ParkingGeometry:
+    """Use car-selected YOLO side lines while retaining LiDAR safety/depth."""
+
+    merged = replace(
+        merge_camera_back_line(geometry, camera_geometry),
+        observed_car_count=camera_geometry.observed_car_count,
+    )
+    if (
+        not camera_geometry.found
+        or not camera_geometry.has_side_pair
+        or camera_geometry.left is None
+        or camera_geometry.right is None
+    ):
+        return merged
+
+    back_center_x = merged.back_center_x_px
+    back_center_y = merged.back_center_y_px
+    stop_target_x = merged.stop_target_x_px
+    stop_target_y = merged.stop_target_y_px
+    depth_to_back = merged.depth_to_back_px
+    depth_remaining = merged.depth_remaining_px
+
+    if (
+        merged.back is not None
+        and camera_geometry.slot_center_x_px is not None
+        and camera_geometry.slot_center_y_px is not None
+    ):
+        center_line = ParkingLine(
+            center_x=camera_geometry.slot_center_x_px,
+            center_y=camera_geometry.slot_center_y_px,
+            direction_x=camera_geometry.slot_direction_x,
+            direction_y=camera_geometry.slot_direction_y,
+            length_px=max(
+                camera_geometry.left.length_px,
+                camera_geometry.right.length_px,
+            ),
+            residual_px=0.0,
+            quality=1.0,
+            point_count=2,
+        )
+        intersection = line_intersection(center_line, merged.back)
+        if intersection is not None:
+            clearance = (
+                hypot(
+                    merged.back_center_x_px - merged.stop_target_x_px,
+                    merged.back_center_y_px - merged.stop_target_y_px,
+                )
+                if merged.back_center_x_px is not None
+                and merged.back_center_y_px is not None
+                and merged.stop_target_x_px is not None
+                and merged.stop_target_y_px is not None
+                else 0.0
+            )
+            direction = (
+                camera_geometry.slot_direction_x,
+                camera_geometry.slot_direction_y,
+            )
+            back_center_x, back_center_y = intersection
+            stop_target_x = back_center_x - direction[0] * clearance
+            stop_target_y = back_center_y - direction[1] * clearance
+            vehicle_to_back = (
+                back_center_x - camera_geometry.vehicle_x_px,
+                back_center_y - camera_geometry.vehicle_y_px,
+            )
+            vehicle_to_stop = (
+                stop_target_x - camera_geometry.vehicle_x_px,
+                stop_target_y - camera_geometry.vehicle_y_px,
+            )
+            depth_to_back = (
+                vehicle_to_back[0] * direction[0]
+                + vehicle_to_back[1] * direction[1]
+            )
+            depth_remaining = (
+                vehicle_to_stop[0] * direction[0]
+                + vehicle_to_stop[1] * direction[1]
+            )
+
+    return replace(
+        merged,
+        found=True,
+        has_side_pair=True,
+        left=camera_geometry.left,
+        right=camera_geometry.right,
+        lateral_error_px=camera_geometry.lateral_error_px,
+        lateral_error_norm=camera_geometry.lateral_error_norm,
+        heading_error_deg=camera_geometry.heading_error_deg,
+        slot_width_px=camera_geometry.slot_width_px,
+        slot_center_x_px=camera_geometry.slot_center_x_px,
+        slot_center_y_px=camera_geometry.slot_center_y_px,
+        slot_direction_x=camera_geometry.slot_direction_x,
+        slot_direction_y=camera_geometry.slot_direction_y,
+        vehicle_x_px=camera_geometry.vehicle_x_px,
+        vehicle_y_px=camera_geometry.vehicle_y_px,
+        back_center_x_px=back_center_x,
+        back_center_y_px=back_center_y,
+        stop_target_x_px=stop_target_x,
+        stop_target_y_px=stop_target_y,
+        depth_to_back_px=depth_to_back,
+        depth_remaining_px=depth_remaining,
+        observed_line_count=camera_geometry.observed_line_count,
+        confidence=max(merged.confidence, camera_geometry.confidence),
+        selection_mode=camera_geometry.selection_mode,
     )
 
 

@@ -117,14 +117,11 @@ class LidarParkingConfig:
     gap_orientation_smooth_alpha: float = 0.25
     gap_max_orientation_jump_deg: float = 35.0
 
-    # The competition guarantees that the first parked car is immediately
-    # followed by the mission bay.  Its front-most longitudinal surface is a
-    # useful early trigger, before the second bordering car is visible.  With
-    # the rear-mounted LiDAR, -650 mm places that surface roughly 350 mm ahead
-    # of the provisional rear axle (-300 mm).
+    # Trigger when the first corner encountered reaches this y_back coordinate.
+    # 0 is level with the LiDAR; negative turns earlier, positive turns later.
     first_car_confirm_scans: int = 2
     first_car_min_x_right_mm: float = 250.0
-    first_car_turn_target_y_back_mm: float = -650.0
+    first_car_turn_target_y_back_mm: float = 0.0
     # A parked car presents a dense, straight body panel to the LiDAR. A person
     # standing beside the vehicle returns a sparse, rounded (low-linearity)
     # blob. Requiring a minimum point count and surface linearity here keeps a
@@ -324,11 +321,10 @@ class LidarParkingSpaceEstimator:
             if first_car is not None
             else None
         )
-        # During the straight approach, decreasing y_back points toward the
-        # upcoming bay.  The minimum-y surface is therefore the edge adjacent
-        # to the guaranteed empty slot.
+        # A parked car moves from negative to positive y_back while ego drives
+        # forward. Its maximum-y corner reaches the LiDAR cross-axis first.
         first_car_edge_y = (
-            first_car.y_back_min_mm if first_car is not None else None
+            first_car.y_back_max_mm if first_car is not None else None
         )
         first_car_turn_error = (
             self.config.first_car_turn_target_y_back_mm - first_car_edge_y

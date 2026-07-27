@@ -1,6 +1,7 @@
 import unittest
 
 from skku_autocar.estimation.lane_geometry import LaneGeometry
+from skku_autocar.perception.yolo_lane import YoloLaneConfig, YoloLaneSegmenter
 from skku_autocar.planning.yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
 from skku_autocar.runtime.yolo_drive_app import (
     CommandSafetyFilter,
@@ -12,6 +13,13 @@ from skku_autocar.types import ControlCommand
 
 
 class YoloLaneGeometryTest(unittest.TestCase):
+    def test_parking_model_car_class_is_preserved(self):
+        segmenter = object.__new__(YoloLaneSegmenter)
+        segmenter.config = YoloLaneConfig()
+
+        self.assertEqual(segmenter._class_kind("car"), "car")
+        self.assertEqual(segmenter._class_kind("line"), "lane")
+
     def test_pd_steering_adds_derivative_when_error_changes(self):
         follower = YoloLaneFollower(
             YoloLaneFollowerConfig(

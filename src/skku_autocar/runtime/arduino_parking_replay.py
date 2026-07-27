@@ -13,7 +13,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ..estimation.locked_slot import LockedSlotPose
-from ..estimation.parking_geometry import ParkingGeometry, ParkingGeometryEstimator
+from ..estimation.parking_geometry import (
+    ParkingGeometry,
+    ParkingGeometryEstimator,
+    filter_parking_car_masks,
+    merge_camera_back_line,
+    merge_camera_slot_guidance,
+)
 from ..estimation.parking_lidar import (
     LidarParkingObservation,
     LidarParkingSpaceEstimator,
@@ -24,6 +30,7 @@ from ..perception.yolo_lane import YoloLaneConfig, YoloLaneSegmenter
 from ..planning.t_parking_planner import ParkingPlan, ParkingState, TParkingPlanner
 from ..sensors.lidar import LidarScan, load_lidar_csv
 from .parking_app import (
+    CAMERA_GUIDED_STATES,
     LOCKED_SLOT_STATES,
     compose_parking_dashboard,
     draw_lidar_debug,
@@ -32,6 +39,7 @@ from .parking_app import (
     extract_recording_zip,
     make_locked_slot_geometry,
     parking_mask_color,
+    validate_parking_model,
 )
 
 
@@ -812,6 +820,7 @@ def run_visual_replay(
                 min_mask_area_ratio=config.yolo.min_mask_area_ratio,
             )
         )
+        validate_parking_model(segmenter)
     transformer = BevTransformer(config.bev)
     geometry_estimator = ParkingGeometryEstimator(config.geometry)
     lidar_estimator = LidarParkingSpaceEstimator(config.lidar)
@@ -878,11 +887,18 @@ def run_visual_replay(
                 )
             else:
                 class_masks = segmenter.segment_class_masks(frame)
-                frame_masks = list(class_masks.lane)
+                car_masks = filter_parking_car_masks(class_masks.car)
+                selected_masks, selection_mode = geometry_estimator.select_masks(
+                    class_masks.lane,
+                    car_masks,
+                )
+                frame_masks = list(selected_masks)
                 bev_masks = [transformer.warp_mask(mask) for mask in frame_masks]
                 camera_geometry = geometry_estimator.estimate(
                     bev_masks,
                     class_masks.lane_conf,
+                    selection_mode,
+                    observed_car_count=len(car_masks),
                 )
                 found = camera_geometry.found and camera_geometry.has_side_pair
                 camera = CameraSample(
@@ -912,6 +928,11 @@ def run_visual_replay(
                     lock_requested=(
                         controller.planner_state in LOCKED_SLOT_STATES
                     ),
+                )
+                geometry = (
+                    merge_camera_slot_guidance(geometry, camera_geometry)
+                    if controller.planner_state in CAMERA_GUIDED_STATES
+                    else merge_camera_back_line(geometry, camera_geometry)
                 )
                 current_rear_cm = rear_lidar_distance_cm(current_scan, config)
                 old_state = controller.state
@@ -1334,6 +1355,7 @@ def analyze_camera(
             min_mask_area_ratio=config.yolo.min_mask_area_ratio,
         )
     )
+    validate_parking_model(segmenter)
     transformer = BevTransformer(config.bev)
     estimator = ParkingGeometryEstimator(config.geometry)
     capture = cv2.VideoCapture(str(video_path))
@@ -1354,8 +1376,18 @@ def analyze_camera(
                 frame_index += 1
                 continue
             class_masks = segmenter.segment_class_masks(frame)
-            bev_masks = [transformer.warp_mask(mask) for mask in class_masks.lane]
-            geometry = estimator.estimate(bev_masks, class_masks.lane_conf)
+            car_masks = filter_parking_car_masks(class_masks.car)
+            selected_masks, selection_mode = estimator.select_masks(
+                class_masks.lane,
+                car_masks,
+            )
+            bev_masks = [transformer.warp_mask(mask) for mask in selected_masks]
+            geometry = estimator.estimate(
+                bev_masks,
+                class_masks.lane_conf,
+                selection_mode,
+                observed_car_count=len(car_masks),
+            )
             found = geometry.found and geometry.has_side_pair
             samples.append(
                 CameraSample(

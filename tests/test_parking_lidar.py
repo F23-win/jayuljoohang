@@ -241,7 +241,7 @@ class ParkingLidarTest(unittest.TestCase):
             self.make_estimator().config,
             min_observed_points=3,
             first_car_confirm_scans=2,
-            first_car_turn_target_y_back_mm=-650.0,
+            first_car_turn_target_y_back_mm=-630.0,
         )
         estimator = LidarParkingSpaceEstimator(config)
         points = tuple(
@@ -262,7 +262,7 @@ class ParkingLidarTest(unittest.TestCase):
         self.assertTrue(second.first_car_turn_reached)
         self.assertEqual(second.car_count, 1)
         self.assertFalse(second.gap_found)
-        self.assertAlmostEqual(second.first_car_slot_edge_y_back_mm, -640.0)
+        self.assertAlmostEqual(second.first_car_slot_edge_y_back_mm, -600.0)
 
     def test_non_right_side_clusters_do_not_trigger_first_car(self):
         config = replace(
@@ -303,7 +303,7 @@ class ParkingLidarTest(unittest.TestCase):
             car_cluster_min_points=2,
             first_car_min_x_right_mm=250.0,
             first_car_confirm_scans=1,
-            first_car_turn_target_y_back_mm=-650.0,
+            first_car_turn_target_y_back_mm=-630.0,
         )
         estimator = LidarParkingSpaceEstimator(config)
         scan = LidarScan(

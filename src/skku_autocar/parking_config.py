@@ -15,7 +15,7 @@ from .planning.t_parking_planner import ParkingPlannerConfig
 
 @dataclass(frozen=True)
 class ParkingYoloConfig:
-    model_path: str = "trained_model/parking_best.pt"
+    model_path: str = "trained_model/0725best.pt"
     confidence: float = 0.35
     image_size: int = 640
     device: str = "auto"
@@ -72,6 +72,14 @@ def load_parking_config(path: str) -> ParkingAppConfig:
         raise ValueError("parking config root must be an object")
 
     lidar_data = section(data, "lidar")
+    planner_values = section(data, "planner")
+    quick_tuning = dict(section(data, "quick_tuning"))
+    lidar_quick_tuning = {
+        key: quick_tuning.pop(key)
+        for key in tuple(quick_tuning)
+        if key in LidarParkingConfig.__dataclass_fields__
+    }
+    planner_values.update(quick_tuning)
     car_roi = RectangleRoi(**section(lidar_data, "car_detection_roi"))
     safety_roi = RectangleRoi(**section(lidar_data, "safety_roi"))
     tracking_roi_data = lidar_data.get("slot_tracking_roi")
@@ -80,6 +88,7 @@ def load_parking_config(path: str) -> ParkingAppConfig:
         for key, value in lidar_data.items()
         if key not in ("car_detection_roi", "safety_roi", "slot_tracking_roi")
     }
+    lidar_values.update(lidar_quick_tuning)
     lidar_values["car_detection_roi"] = car_roi
     lidar_values["safety_roi"] = safety_roi
     if tracking_roi_data is not None:
@@ -95,7 +104,7 @@ def load_parking_config(path: str) -> ParkingAppConfig:
         geometry=ParkingGeometryConfig(**section(data, "geometry")),
         lidar=LidarParkingConfig(**lidar_values),
         path=ReversePathConfig(**section(data, "path")),
-        planner=ParkingPlannerConfig(**section(data, "planner")),
+        planner=ParkingPlannerConfig(**planner_values),
         runtime=ParkingRuntimeConfig(**section(data, "runtime")),
     )
 

@@ -15,6 +15,7 @@ class YoloLaneConfig:
     center_classes: Tuple[str, ...] = ("lane-center", "center")
     side_classes: Tuple[str, ...] = ("lane-side", "side")
     crosswalk_classes: Tuple[str, ...] = ("crosswalk", "cross-walk", "zebra")
+    car_classes: Tuple[str, ...] = ("car", "vehicle")
     lane_classes: Tuple[str, ...] = (
         "lane",
         "line",
@@ -44,25 +45,26 @@ class YoloLaneMask:
 class YoloClassMasks:
     """Per-class frame-space masks WITHOUT any corridor geometry applied.
 
-    Plan A warps these into BEV first and builds the corridor there, so the raw
-    class masks are all this stage produces. Side instances are kept separate
-    (a tuple, not ORed) so left/right side lines can be fitted independently.
+    The raw instance masks are all this stage produces. Instances stay separate
+    so lane boundaries and parking cars can be matched before BEV fitting.
     """
 
     center: Tuple[Any, ...] = ()
     side: Tuple[Any, ...] = ()
     lane: Tuple[Any, ...] = ()
     crosswalk: Tuple[Any, ...] = ()
+    car: Tuple[Any, ...] = ()
     center_conf: float = 0.0
     side_conf: float = 0.0
     lane_conf: float = 0.0
     crosswalk_conf: float = 0.0
+    car_conf: float = 0.0
     device: str = "cpu"
     inference_ms: float = 0.0
 
     @property
     def found(self) -> bool:
-        return bool(self.center or self.side or self.lane or self.crosswalk)
+        return bool(self.center or self.side or self.lane or self.crosswalk or self.car)
 
 
 def select_yolo_device(preferred: str = "auto") -> str:
@@ -210,15 +212,18 @@ class YoloLaneSegmenter:
         side, side_conf = group("side")
         lane, lane_conf = group("lane")
         crosswalk, crosswalk_conf = group("crosswalk")
+        car, car_conf = group("car")
         return YoloClassMasks(
             center=center,
             side=side,
             lane=lane,
             crosswalk=crosswalk,
+            car=car,
             center_conf=center_conf,
             side_conf=side_conf,
             lane_conf=lane_conf,
             crosswalk_conf=crosswalk_conf,
+            car_conf=car_conf,
             device=self.device,
             inference_ms=self._inference_ms(result),
         )
@@ -271,6 +276,8 @@ class YoloLaneSegmenter:
         # Crosswalk is checked first so it is never absorbed by a lane class.
         if any(token in lowered for token in self.config.crosswalk_classes):
             return "crosswalk"
+        if any(token in lowered for token in self.config.car_classes):
+            return "car"
         if any(token in lowered for token in self.config.center_classes):
             return "center"
         if any(token in lowered for token in self.config.side_classes):

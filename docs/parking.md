@@ -19,7 +19,7 @@
 주차 모델은 일반 주행 모델과 분리한다.
 
 ```text
-trained_model/parking_best.pt
+trained_model/0725best.pt
 ```
 
 Roboflow COCO segmentation 데이터로 `yolov8n-seg.pt`를 미세조정한 모델이며,
@@ -275,7 +275,7 @@ Apple Silicon에서는 `--device auto`가 MPS를 선택한다. 모터 출력은 
 ..\venv\Scripts\python.exe scripts/parking.py `
   --source 1 `
   --lidar-port COM5 `
-  --model trained_model/parking_best.pt `
+  --model trained_model/0725best.pt `
   --device mps `
   --serial `
   --serial-port COM6
@@ -289,7 +289,7 @@ macOS 실차 실행 예시는 다음과 같다. `--prealign-steering -150`은 �
 python3 scripts/parking.py \
   --source 1 \
   --lidar-port /dev/cu.usbserial-LIDAR \
-  --model trained_model/parking_best.pt \
+  --model trained_model/0725best.pt \
   --device mps \
   --serial \
   --serial-port /dev/cu.usbmodem-ARDUINO \
