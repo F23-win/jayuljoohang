@@ -85,6 +85,29 @@ class ParkingLidarTest(unittest.TestCase):
         self.assertAlmostEqual(left[0], -1000.0, delta=1.0)
         self.assertAlmostEqual(left[1], 0.0, delta=1.0)
 
+    def test_side_clusters_use_wide_roi_before_gap_confirmation(self):
+        estimator = self.make_estimator()
+        scan = LidarScan(
+            1.0,
+            tuple(
+                point_at(x, y)
+                for x in (-820.0, -800.0, -780.0, 780.0, 800.0, 820.0)
+                for y in (0.0,)
+            ),
+        )
+
+        observation = estimator.estimate(scan, now=1.0)
+
+        self.assertTrue(
+            all(cluster.center_x_right_mm > 0.0 for cluster in observation.car_clusters)
+        )
+        self.assertTrue(
+            any(cluster.center_x_right_mm < 0.0 for cluster in observation.side_car_clusters)
+        )
+        self.assertTrue(
+            any(cluster.center_x_right_mm > 0.0 for cluster in observation.side_car_clusters)
+        )
+
     def test_first_car_rejects_sparse_or_rounded_person_cluster(self):
         from skku_autocar.estimation.parking_lidar import (
             is_first_car_eligible,
@@ -811,6 +834,7 @@ class ParkingLidarTest(unittest.TestCase):
 
         self.assertTrue(observation.gap_found)
         self.assertTrue(observation.unsafe)
+        self.assertAlmostEqual(observation.safety_center_x_right_mm, 0.0)
         self.assertEqual(observation.reason, "safety_obstacle")
 
     def test_safety_envelope_requires_configured_consecutive_scans(self):

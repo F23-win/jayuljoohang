@@ -909,11 +909,13 @@ def run_visual_replay(
                 )
                 frame_masks = list(selected_masks)
                 bev_masks = [transformer.warp_mask(mask) for mask in frame_masks]
+                bev_car_masks = [transformer.warp_mask(mask) for mask in car_masks]
                 camera_geometry = geometry_estimator.estimate(
                     bev_masks,
-                    class_masks.lane_conf,
+                    max(class_masks.lane_conf, class_masks.car_conf),
                     selection_mode,
                     observed_car_count=len(car_masks),
+                    car_masks=bev_car_masks,
                 )
                 found = camera_geometry.found and camera_geometry.has_side_pair
                 camera = CameraSample(
@@ -1406,11 +1408,13 @@ def analyze_camera(
                 car_masks,
             )
             bev_masks = [transformer.warp_mask(mask) for mask in selected_masks]
+            bev_car_masks = [transformer.warp_mask(mask) for mask in car_masks]
             geometry = estimator.estimate(
                 bev_masks,
-                class_masks.lane_conf,
+                max(class_masks.lane_conf, class_masks.car_conf),
                 selection_mode,
                 observed_car_count=len(car_masks),
+                car_masks=bev_car_masks,
             )
             found = geometry.found and geometry.has_side_pair
             samples.append(

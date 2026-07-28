@@ -480,11 +480,15 @@ def run_prepared(args: argparse.Namespace) -> int:
                 )
                 parking_masks = list(selected_masks)
                 bev_masks = [transformer.warp_mask(mask) for mask in parking_masks]
+                bev_car_masks = [
+                    transformer.warp_mask(mask) for mask in yolo_car_masks
+                ]
                 camera_geometry = geometry_estimator.estimate(
                     bev_masks,
-                    class_masks.lane_conf,
+                    max(class_masks.lane_conf, class_masks.car_conf),
                     selection_mode,
                     observed_car_count=len(yolo_car_masks),
+                    car_masks=bev_car_masks,
                 )
             else:
                 yolo_car_masks = []
@@ -1085,10 +1089,11 @@ def draw_debug(
             geometry.heading_error_deg,
             depth,
         ),
-        "lidar=%s points=%d cars=%d gap=%s err=%s safety=%s" % (
+        "lidar=%s points=%d cars=%d side=%d gap=%s err=%s safety=%s" % (
             lidar.reason,
             lidar.observed_points,
             lidar.car_count,
+            len(lidar.side_car_clusters),
             "-" if lidar.gap_width_mm is None else "%.0fmm" % lidar.gap_width_mm,
             "-" if lidar.entry_error_mm is None else "%+.0fmm" % lidar.entry_error_mm,
             safety,
@@ -1370,10 +1375,11 @@ def draw_lidar_debug(
     draw_vehicle_direction_labels(cv2, canvas, origin, scale, rotation_deg)
     cv2.putText(
         canvas,
-        "%s%s cars=%d first=%s turnErr=%s gap=%s err=%s" % (
+        "%s%s cars=%d side=%d first=%s turnErr=%s gap=%s err=%s" % (
             observation.reason,
             " HOLD" if observation.coasted else "",
             observation.car_count,
+            len(observation.side_car_clusters),
             "Y" if observation.first_car_confirmed else "N",
             (
                 "-"
@@ -1891,7 +1897,7 @@ def draw_bev_maneuver_path(
         if plan.state == ParkingState.PREALIGN_LEFT:
             bend = -width * 0.32
         elif plan.command.steering:
-            bend = width * 0.25 * plan.command.steering / 150.0
+            bend = -width * 0.25 * plan.command.steering / 150.0
         points = np.asarray(
             [
                 [

@@ -44,6 +44,15 @@ def horizontal_mask(y, shape=(200, 200)):
     return mask
 
 
+def slanted_mask(x_top, x_bottom, shape=(200, 200)):
+    mask = np.zeros(shape, dtype=np.uint8)
+    for y in range(40, 190):
+        ratio = (y - 40) / 149.0
+        x = int(round(x_top + (x_bottom - x_top) * ratio))
+        mask[y, max(0, x - 2) : min(shape[1], x + 3)] = 255
+    return mask
+
+
 def vertical_line(x):
     from skku_autocar.estimation.parking_geometry import ParkingLine
 
@@ -90,6 +99,47 @@ class ParkingGeometryTest(unittest.TestCase):
         self.assertEqual(geometry.left.mask_index, 0)
         self.assertEqual(geometry.right.mask_index, 1)
         self.assertEqual(geometry.back.mask_index, 2)
+
+    def test_three_line_cross_anchor_accepts_diverging_side_lines(self):
+        estimator = self.make_estimator(
+            slot_width_max_px=160.0,
+            expected_slot_width_px=120.0,
+        )
+        left = slanted_mask(50, 25)
+        right = slanted_mask(150, 175)
+
+        geometry = estimator.estimate(
+            [left, right, horizontal_mask(40)],
+            confidence=1.0,
+            selection_mode="three_line_after_car",
+        )
+
+        self.assertTrue(geometry.found)
+        self.assertTrue(geometry.has_side_pair)
+        self.assertTrue(geometry.has_back_line)
+        self.assertEqual(geometry.selection_mode, "three_line_after_car")
+        self.assertGreater(
+            axial_angle_difference(
+                geometry.left.angle_deg,
+                geometry.right.angle_deg,
+            ),
+            estimator.config.parallel_tolerance_deg,
+        )
+        self.assertGreaterEqual(geometry.back.mask_index, 0)
+
+    def test_three_parallel_lines_are_rejected_after_car(self):
+        estimator = self.make_estimator()
+
+        geometry = estimator.estimate(
+            [vertical_mask(40), vertical_mask(100), vertical_mask(160)],
+            confidence=1.0,
+            selection_mode="three_line_after_car",
+        )
+
+        self.assertFalse(geometry.found)
+        self.assertEqual(geometry.selection_mode, "three_line_after_car")
+        self.assertEqual(geometry.observed_line_count, 3)
+        self.assertEqual(geometry.reason, "three_line_bay_invalid")
 
     def test_parallel_pair_builds_virtual_depth_for_bev_reverse_path(self):
         geometry = self.make_estimator().estimate(parking_masks()[:2], confidence=1.0)
@@ -344,6 +394,12 @@ class ParkingGeometryTest(unittest.TestCase):
 
         self.assertEqual(filter_parking_car_masks([car], 0.20), (car,))
 
+    def test_vehicle_mask_filter_rejects_upper_background_car_by_default(self):
+        background_car = np.zeros((200, 200), dtype=np.uint8)
+        background_car[20:48, 45:155] = 255
+
+        self.assertEqual(filter_parking_car_masks([background_car]), ())
+
     def test_camera_only_merge_uses_camera_vehicle_reference_for_depth(self):
         camera = self.make_estimator().estimate(
             [vertical_mask(110)],
@@ -457,6 +513,111 @@ class ParkingGeometryTest(unittest.TestCase):
         self.assertTrue(merged.found)
         self.assertTrue(merged.has_side_pair)
         self.assertEqual(merged.selection_mode, "line_only")
+
+    def test_three_line_bay_takes_over_after_yolo_car_disappears(self):
+        estimator = self.make_estimator(
+            min_confirm_frames=3,
+            jump_reconfirm_frames=5,
+        )
+        masks = parking_masks()
+        for _ in range(3):
+            selected, car_mode = estimator.select_masks(
+                masks,
+                [car_mask(160, 190)],
+            )
+            estimator.estimate(selected, confidence=1.0, selection_mode=car_mode)
+
+        selected, mode = estimator.select_masks(masks, [])
+        attempts = [
+            estimator.estimate(
+                selected,
+                confidence=1.0,
+                selection_mode=mode,
+            )
+            for _ in range(3)
+        ]
+        recovered = attempts[-1]
+
+        self.assertEqual(mode, "three_line_after_car")
+        self.assertTrue(all(not item.found for item in attempts[:2]))
+        self.assertTrue(recovered.found)
+        self.assertTrue(recovered.has_side_pair)
+        self.assertTrue(recovered.has_back_line)
+        self.assertEqual(recovered.selection_mode, "three_line_after_car")
+        self.assertFalse(recovered.coasted)
+
+    def test_two_parallel_lines_keep_live_path_after_car_disappears(self):
+        estimator = self.make_estimator(max_coast_frames=2)
+        masks = parking_masks()
+        estimator.select_masks(masks, [car_mask(160, 190)])
+        selected, mode = estimator.select_masks(masks, [])
+        recovered = estimator.estimate(
+            selected,
+            confidence=1.0,
+            selection_mode=mode,
+        )
+
+        side_lines, mode = estimator.select_masks(masks[:2], [])
+        lost = estimator.estimate(
+            side_lines,
+            confidence=1.0,
+            selection_mode=mode,
+        )
+
+        self.assertTrue(recovered.found)
+        self.assertTrue(lost.found)
+        self.assertFalse(lost.coasted)
+        self.assertEqual(lost.observed_line_count, 2)
+        self.assertEqual(lost.selection_mode, "two_line_after_car")
+
+    def test_two_line_t_corner_builds_missing_side_after_car_disappears(self):
+        estimator = self.make_estimator()
+        masks = parking_masks()
+        estimator.select_masks(masks, [car_mask(160, 190)])
+
+        selected, mode = estimator.select_masks([masks[0], masks[2]], [])
+        recovered = estimator.estimate(
+            selected,
+            confidence=1.0,
+            selection_mode=mode,
+        )
+        path = ReverseParkingPathGenerator().generate(recovered)
+
+        self.assertEqual(mode, "two_line_after_car")
+        self.assertTrue(recovered.found)
+        self.assertTrue(recovered.has_side_pair)
+        self.assertTrue(recovered.has_back_line)
+        self.assertEqual(recovered.back.mask_index, 1)
+        self.assertFalse(recovered.coasted)
+        self.assertTrue(path.found)
+
+    def test_one_car_without_lines_selects_car_only_path(self):
+        car = car_mask(140, 190)
+
+        selected, mode = select_parking_line_masks([], [car])
+
+        self.assertEqual(selected, ())
+        self.assertEqual(mode, "car_only_left")
+
+    def test_car_only_mask_builds_virtual_bev_path(self):
+        estimator = self.make_estimator()
+        car = car_mask(140, 190)
+        selected, mode = estimator.select_masks([], [car])
+
+        geometry = estimator.estimate(
+            selected,
+            confidence=1.0,
+            selection_mode=mode,
+            observed_car_count=1,
+            car_masks=[car],
+        )
+        path = ReverseParkingPathGenerator().generate(geometry)
+
+        self.assertTrue(geometry.found)
+        self.assertTrue(geometry.has_side_pair)
+        self.assertTrue(geometry.has_back_line)
+        self.assertEqual(geometry.selection_mode, "car_only_left")
+        self.assertTrue(path.found)
 
 
 if __name__ == "__main__":

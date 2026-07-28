@@ -6,10 +6,7 @@ from math import atan2, degrees, hypot
 from typing import Optional
 
 from ..estimation.parking_geometry import ParkingGeometry
-from ..estimation.parking_lidar import (
-    LidarParkingObservation,
-    first_car_bearing_from_forward_deg,
-)
+from ..estimation.parking_lidar import LidarParkingObservation
 from ..types import ControlCommand
 from .reverse_parking_path import (
     ReverseParkingPathGenerator,
@@ -44,6 +41,7 @@ class ParkingState(str, Enum):
 class ParkingPlannerConfig:
     search_speed: int = 42 #첫 차량을 찾으면서 직진하는 속도
     start_forward_s: float = 5.0 #스페이스바 시작 후 차량 검출을 무시하고 직진하는 시간 (초)
+    initial_search_steering_trim: int = 0
     straight_steering_trim: int = 0
     gap_tracking_speed: int = 30 #두 차량 사이 공간을 추적할 때의 모터 속도
     position_speed: int = 22 #후륜축 중심을 공간 중심에 맞출 때 사용하는 속도
@@ -64,12 +62,12 @@ class ParkingPlannerConfig:
     prealign_center_x_tolerance_mm: float = 180.0
     prealign_curve_entry_bearing_tolerance_deg: float = 45.0 #주차칸과의 각도
     prealign_curve_center_x_tolerance_mm: float = 1400.0
-    prealign_first_car_bearing_min_deg: float = 120.0
     prealign_target_distance_min_mm: float = 900.0
     prealign_target_distance_max_mm: float = 2600.0
-    prealign_confirm_frames: int = 1 #정렬 조건을 만족해야 하는 프레임 수
+    prealign_confirm_frames: int = 3 #정렬 조건을 만족해야 하는 프레임 수
     prealign_path_hold_frames: int = 3
-    prealign_yolo_min_lines: int = 1
+    prealign_lidar_confirm_scans: int = 1
+    prealign_yolo_min_cars: int = 1
     prealign_yolo_hold_frames: int = 3
     prealign_heading_overshoot_deg: float = 25.0
     ultrasonic_kp_steering_per_mm: float = 0.23
@@ -79,6 +77,11 @@ class ParkingPlannerConfig:
     ultrasonic_stale_after_s: float = 0.8
     ultrasonic_inside_max_mm: float = 600.0
     ultrasonic_inside_confirm_frames: int = 3
+    ultrasonic_resume_confirm_frames: int = 3
+    lidar_resume_confirm_scans: int = 3
+    car_only_speed_ratio: float = 0.70
+    lidar_evasion_speed: int = -24
+    lidar_evasion_center_deadband_mm: float = 80.0
     reverse_entry_speed: int = -32 #곡선 후진 속도
     reverse_center_speed: int = -22 #정렬된 후 직선 후진 속도
     reverse_aligned_speed: int = -40
@@ -88,7 +91,12 @@ class ParkingPlannerConfig:
     reverse_entry_steer_settle_s: float = 0.40
     reverse_entry_release_heading_deg: float = 12.0
     reverse_entry_release_confirm_frames: int = 3
-    entry_path_loss_grace_frames: int = 0
+    reverse_entry_unwind_max_steering: int = 100
+    entry_path_loss_grace_s: float = 1.5
+    lidar_y0_band_half_width_mm: float = 150.0
+    lidar_y0_clear_confirm_scans: int = 3
+    lidar_y0_hold_s: float = 3.5
+    lidar_y0_exit_s: float = 4.0
     # lidar_box_curve 진입에서 max 고정 조향을 heading 풀릴 때까지 유지하는 대신,
     # 매 프레임 BEV 경로 곡률로 조향을 재계산해 계속 자세제어한다. reverse_entry_min_steering
     # 바닥은 유지되므로 진입 초반엔 여전히 세게 꺾는다. False면 기존 고정 조향으로 되돌아간다.
@@ -161,8 +169,10 @@ class TParkingPlanner:
         self._prealign_aligned_frames = 0
         self._prealign_last_path: Optional[ReversePath] = None
         self._prealign_path_age_frames = 0
-        self._prealign_yolo_hold_frames = 0
+        self._prealign_yolo_car_hold_frames = 0
         self._prealign_lidar_gate_latched = False
+        self._prealign_lidar_confirm_scans = 0
+        self._prealign_lidar_last_timestamp: Optional[float] = None
         self._prealign_gap_acquired_at: Optional[float] = None
         self._reverse_path_confirm_frames = 0
         self._reverse_entry_mode = "lidar_box_curve"
@@ -170,13 +180,29 @@ class TParkingPlanner:
         self._reverse_entry_steering_direction = 0
         self._reverse_entry_selection_mode = ""
         self._last_entry_path: Optional[ReversePath] = None
+        self._last_entry_car_only = False
         self._entry_path_loss_frames = 0
+        self._entry_path_lost_at: Optional[float] = None
+        self._entry_timeout_paused_at: Optional[float] = None
         self._reverse_entry_unwinding = False
         self._last_entry_steering = 0
+        self._reverse_start_pending = False
         self._entry_heading_ready_frames = 0
         self._body_mid_inside_frames = 0
         self._body_mid_inside = False
         self._aligned_reverse_started_at: Optional[float] = None
+        self._lidar_y0_terminal_armed = False
+        self._lidar_y0_both_sides_seen = False
+        self._lidar_y0_clear_scans = 0
+        self._lidar_y0_last_timestamp: Optional[float] = None
+        self._straight_exit_after_lidar_y0_clear = False
+        self._emergency_source = ""
+        self._emergency_resume_state: Optional[ParkingState] = None
+        self._ultrasonic_resume_frames = 0
+        self._ultrasonic_clear_started_at: Optional[float] = None
+        self._lidar_recovery_required = False
+        self._lidar_resume_scans = 0
+        self._lidar_resume_last_timestamp: Optional[float] = None
 
     def start(self, now: float) -> bool:
         if self.state not in (
@@ -195,18 +221,36 @@ class TParkingPlanner:
         self._first_car_turn_reached_at = None
         self._last_search_detection_at = None
         self._prealign_lidar_gate_latched = False
+        self._prealign_lidar_confirm_scans = 0
+        self._prealign_lidar_last_timestamp = None
         self._entry_heading_ready_frames = 0
         self._body_mid_inside_frames = 0
         self._body_mid_inside = False
         self._aligned_reverse_started_at = None
+        self._lidar_y0_terminal_armed = False
+        self._lidar_y0_both_sides_seen = False
+        self._lidar_y0_clear_scans = 0
+        self._lidar_y0_last_timestamp = None
+        self._straight_exit_after_lidar_y0_clear = False
         self._reverse_entry_mode = "lidar_box_curve"
         self._reverse_entry_virtual_left = False
         self._reverse_entry_steering_direction = 0
         self._reverse_entry_selection_mode = ""
         self._last_entry_path = None
+        self._last_entry_car_only = False
         self._entry_path_loss_frames = 0
+        self._entry_path_lost_at = None
+        self._entry_timeout_paused_at = None
         self._reverse_entry_unwinding = False
         self._last_entry_steering = 0
+        self._reverse_start_pending = False
+        self._emergency_source = ""
+        self._emergency_resume_state = None
+        self._ultrasonic_resume_frames = 0
+        self._ultrasonic_clear_started_at = None
+        self._lidar_recovery_required = False
+        self._lidar_resume_scans = 0
+        self._lidar_resume_last_timestamp = None
         self._enter(ParkingState.SEARCH_CARS, now)
         return True
 
@@ -224,8 +268,10 @@ class TParkingPlanner:
         self._prealign_aligned_frames = 0
         self._prealign_last_path = None
         self._prealign_path_age_frames = 0
-        self._prealign_yolo_hold_frames = 0
+        self._prealign_yolo_car_hold_frames = 0
         self._prealign_lidar_gate_latched = False
+        self._prealign_lidar_confirm_scans = 0
+        self._prealign_lidar_last_timestamp = None
         self._prealign_gap_acquired_at = None
         self._reverse_path_confirm_frames = 0
         self._reverse_entry_mode = "lidar_box_curve"
@@ -233,13 +279,29 @@ class TParkingPlanner:
         self._reverse_entry_steering_direction = 0
         self._reverse_entry_selection_mode = ""
         self._last_entry_path = None
+        self._last_entry_car_only = False
         self._entry_path_loss_frames = 0
+        self._entry_path_lost_at = None
+        self._entry_timeout_paused_at = None
         self._reverse_entry_unwinding = False
         self._last_entry_steering = 0
+        self._reverse_start_pending = False
         self._entry_heading_ready_frames = 0
         self._body_mid_inside_frames = 0
         self._body_mid_inside = False
         self._aligned_reverse_started_at = None
+        self._lidar_y0_terminal_armed = False
+        self._lidar_y0_both_sides_seen = False
+        self._lidar_y0_clear_scans = 0
+        self._lidar_y0_last_timestamp = None
+        self._straight_exit_after_lidar_y0_clear = False
+        self._emergency_source = ""
+        self._emergency_resume_state = None
+        self._ultrasonic_resume_frames = 0
+        self._ultrasonic_clear_started_at = None
+        self._lidar_recovery_required = False
+        self._lidar_resume_scans = 0
+        self._lidar_resume_last_timestamp = None
 
     @property
     def prealign_confirmed_frames(self) -> int:
@@ -282,17 +344,112 @@ class TParkingPlanner:
                 elif lidar.gap_confirmed and lidar.car_count >= 2:
                     self._reverse_entry_selection_mode = "two_car"
         self._update_body_mid_inside(left_ultrasonic_mm, right_ultrasonic_mm)
+        if self.state not in (
+            ParkingState.IDLE,
+            ParkingState.ABORTED,
+            ParkingState.EXIT_DONE,
+        ):
+            lidar_hold_reason = self._lidar_recovery_hold_reason(lidar)
+            if lidar_hold_reason is not None:
+                return self._stop(lidar_hold_reason, self._last_entry_path)
         if self.state == ParkingState.PARKED:
-            if self._state_elapsed(now) >= max(0.0, self.config.park_hold_s):
+            hold_s = (
+                self.config.lidar_y0_hold_s
+                if self._straight_exit_after_lidar_y0_clear
+                else self.config.park_hold_s
+            )
+            if self._state_elapsed(now) >= max(0.0, hold_s):
+                if self._straight_exit_after_lidar_y0_clear:
+                    self._enter(ParkingState.EXIT_STRAIGHT, now)
+                    return self._drive(
+                        self._exit_speed(),
+                        self._straight_steering(),
+                        "lidar_y0_clear_exit_straight",
+                    )
                 self._enter(ParkingState.EXIT_RIGHT, now)
                 return self._exit_right_plan(now)
-            return self._stop("parked_hold")
+            return self._stop(
+                "lidar_y0_clear_parked_hold"
+                if self._straight_exit_after_lidar_y0_clear
+                else "parked_hold"
+            )
         if self.state == ParkingState.EXIT_DONE:
             return self._stop("exit_done")
         if self.state == ParkingState.ABORTED:
             return self._stop("parking_aborted")
         if self.state == ParkingState.EMERGENCY_STOP:
-            return self._stop("emergency_stop_latched")
+            if self._emergency_source != "side_ultrasonic":
+                return self._stop("emergency_stop_latched")
+            ultrasonic_clear = (
+                self._usable_ultrasonic(left_ultrasonic_mm)
+                and self._usable_ultrasonic(right_ultrasonic_mm)
+                and float(left_ultrasonic_mm) > self.config.ultrasonic_emergency_mm
+                and float(right_ultrasonic_mm) > self.config.ultrasonic_emergency_mm
+            )
+            if ultrasonic_clear:
+                if self._ultrasonic_clear_started_at is None:
+                    self._ultrasonic_clear_started_at = now
+            else:
+                self._ultrasonic_clear_started_at = None
+            self._ultrasonic_resume_frames = (
+                self._ultrasonic_resume_frames + 1 if ultrasonic_clear else 0
+            )
+            required_clear_frames = max(
+                1,
+                self.config.ultrasonic_resume_confirm_frames,
+            )
+            if self._ultrasonic_resume_frames < required_clear_frames:
+                return self._stop(
+                    "side_ultrasonic_resume_check:%d/%d"
+                    % (self._ultrasonic_resume_frames, required_clear_frames)
+                )
+            recovery_path = (
+                self.path_generator.generate(geometry)
+                if self._full_geometry_usable(geometry) and not geometry.coasted
+                else None
+            )
+            recovery_is_live = recovery_path is not None and recovery_path.found
+            if not recovery_is_live:
+                clear_started_at = self._ultrasonic_clear_started_at
+                stale_path_available = (
+                    self._last_entry_path is not None
+                    and clear_started_at is not None
+                    and now - clear_started_at
+                    <= max(0.0, self.config.entry_path_loss_grace_s)
+                )
+                if not stale_path_available:
+                    return self._stop(
+                        "side_ultrasonic_cleared:waiting_for_live_path",
+                        recovery_path,
+                    )
+                recovery_path = self._last_entry_path
+            resume_state = self._emergency_resume_state
+            if resume_state not in (
+                ParkingState.FOLLOW_ENTRY_CURVE,
+                ParkingState.FOLLOW_SLOT_CENTER,
+                ParkingState.CORRECT_REVERSE,
+            ):
+                resume_state = ParkingState.FOLLOW_ENTRY_CURVE
+            self._last_entry_path = recovery_path
+            if recovery_is_live:
+                self._last_entry_car_only = self._car_only_guidance(geometry)
+            self._entry_path_loss_frames = 0
+            self._emergency_source = ""
+            self._emergency_resume_state = None
+            self._ultrasonic_resume_frames = 0
+            self._enter(resume_state, now)
+            self._entry_path_lost_at = (
+                None if recovery_is_live else self._ultrasonic_clear_started_at
+            )
+            self._ultrasonic_clear_started_at = None
+            return self._stop(
+                (
+                    "side_ultrasonic_cleared:path_reacquired"
+                    if recovery_is_live
+                    else "side_ultrasonic_cleared:last_path_recovery"
+                ),
+                recovery_path,
+            )
 
         reverse_ultrasonic_states = (
             ParkingState.FOLLOW_ENTRY_CURVE,
@@ -306,6 +463,10 @@ class TParkingPlanner:
                 or self._ultrasonic_emergency(right_ultrasonic_mm)
             )
         ):
+            self._emergency_source = "side_ultrasonic"
+            self._emergency_resume_state = self.state
+            self._ultrasonic_resume_frames = 0
+            self._ultrasonic_clear_started_at = None
             self._enter(ParkingState.EMERGENCY_STOP, now)
             return self._stop("side_ultrasonic_distance<=%.0fmm" % self.config.ultrasonic_emergency_mm)
 
@@ -317,26 +478,50 @@ class TParkingPlanner:
             ParkingState.CORRECT_FORWARD,
             ParkingState.CORRECT_REVERSE,
         )
-        if self.state in slot_and_reverse_states and not lidar.valid:
-            return self._stop("lidar_unavailable_during_reverse")
         if lidar.unsafe and self.state in slot_and_reverse_states:
-            self._enter(ParkingState.EMERGENCY_STOP, now)
-            return self._stop("lidar_safety_obstacle")
-
-        if self.state == ParkingState.PREALIGN_LEFT:
-            if not lidar.valid:
-                return self._prealign_drive(
-                    self._state_elapsed(now),
-                    "prealign_waiting_for_lidar",
+            safety_x = lidar.safety_center_x_right_mm
+            deadband = max(0.0, self.config.lidar_evasion_center_deadband_mm)
+            if (
+                self.state in reverse_ultrasonic_states
+                and safety_x is not None
+                and abs(safety_x) >= deadband
+            ):
+                steering = (
+                    abs(int(self.config.max_steering))
+                    if safety_x < 0.0
+                    else -abs(int(self.config.max_steering))
                 )
+                return self._drive(
+                    -abs(int(self.config.lidar_evasion_speed)),
+                    steering,
+                    "lidar_evasion:%s:x=%+.0fmm"
+                    % (
+                        "left_to_right" if safety_x < 0.0 else "right_to_left",
+                        safety_x,
+                    ),
+                )
+            if self.state in reverse_ultrasonic_states:
+                steering = self._last_entry_steering or self._fixed_right_entry_steering()
+                return self._drive(
+                    -abs(int(self.config.lidar_evasion_speed)),
+                    steering,
+                    "lidar_evasion:center_last_safe:steer=%+d" % steering,
+                    self._last_entry_path,
+                )
+            return self._stop("lidar_safety_center_hold")
 
         if self.state == ParkingState.EXIT_RIGHT:
             return self._exit_right_plan(now)
 
         if self.state == ParkingState.EXIT_STRAIGHT:
+            straight_s = (
+                self.config.lidar_y0_exit_s
+                if self._straight_exit_after_lidar_y0_clear
+                else self.config.exit_straight_s
+            )
             if (
-                self.config.exit_straight_s > 0.0
-                and self._state_elapsed(now) >= self.config.exit_straight_s
+                straight_s > 0.0
+                and self._state_elapsed(now) >= straight_s
             ):
                 self._enter(ParkingState.EXIT_DONE, now)
                 return self._stop("exit_complete")
@@ -349,17 +534,23 @@ class TParkingPlanner:
         if self.state == ParkingState.SEARCH_CARS:
             if self._expired(now, self.config.search_timeout_s):
                 return self._abort(now, "parked_car_search_timeout")
+            # The launch trim compensates hardware drift only until the first
+            # car has ever been seen; a later detection dropout must not revive it.
+            object_detected = lidar.first_car_seen
+            if object_detected:
+                self._last_search_detection_at = now
             if self._state_elapsed(now) < max(0.0, self.config.start_forward_s):
                 return self._drive(
                     self.config.search_speed,
-                    self._straight_steering(),
+                    (
+                        self._initial_search_steering()
+                        if self._last_search_detection_at is None
+                        else self._straight_steering()
+                    ),
                     "start_forward_rollout",
                 )
             # Camera car masks guide the BEV slot, but only a geometrically
             # eligible right-side LiDAR cluster may change driving state.
-            object_detected = lidar.first_car_seen
-            if object_detected:
-                self._last_search_detection_at = now
             if not lidar.valid:
                 return self._stop("waiting_for_lidar_scan")
             if (
@@ -438,7 +629,11 @@ class TParkingPlanner:
                 )
             return self._drive(
                 self.config.search_speed,
-                self._straight_steering(),
+                (
+                    self._initial_search_steering()
+                    if self._last_search_detection_at is None
+                    else self._straight_steering()
+                ),
                 "searching_for_parked_cars",
             )
 
@@ -529,20 +724,21 @@ class TParkingPlanner:
 
         if self.state == ParkingState.PREALIGN_LEFT:
             elapsed = now - self._state_started_at
-            first_car_bearing = first_car_bearing_from_forward_deg(lidar)
-            fresh_pair = (
-                lidar.gap_confirmed
-                and lidar.gap_pair_observed
+            fresh_lidar_cars = (
+                lidar.valid
                 and lidar.car_count >= 2
-                and not lidar.coasted
             )
-            first_car_angle_ready = (
-                first_car_bearing is not None
-                and first_car_bearing + 1e-6
-                >= self.config.prealign_first_car_bearing_min_deg
-            )
-            if fresh_pair and first_car_angle_ready:
-                self._prealign_lidar_gate_latched = True
+            if lidar.timestamp != self._prealign_lidar_last_timestamp:
+                self._prealign_lidar_last_timestamp = lidar.timestamp
+                self._prealign_lidar_confirm_scans = (
+                    self._prealign_lidar_confirm_scans + 1
+                    if fresh_lidar_cars
+                    else 0
+                )
+                self._prealign_lidar_gate_latched = (
+                    self._prealign_lidar_confirm_scans
+                    >= max(1, self.config.prealign_lidar_confirm_scans)
+                )
             prealign_path = (
                 self.path_generator.generate(geometry)
                 if self._full_geometry_usable(geometry)
@@ -550,6 +746,7 @@ class TParkingPlanner:
             )
             current_path_ready = (
                 self._camera_guidance_usable(geometry)
+                and not geometry.coasted
                 and prealign_path is not None
                 and prealign_path.found
             )
@@ -564,20 +761,20 @@ class TParkingPlanner:
                 <= max(0, self.config.prealign_path_hold_frames)
                 else None
             )
-            if geometry.observed_line_count >= max(
+            if geometry.observed_car_count >= max(
                 1,
-                self.config.prealign_yolo_min_lines,
+                self.config.prealign_yolo_min_cars,
             ):
-                self._prealign_yolo_hold_frames = max(
+                self._prealign_yolo_car_hold_frames = max(
                     1,
                     self.config.prealign_yolo_hold_frames,
                 )
             else:
-                self._prealign_yolo_hold_frames = max(
+                self._prealign_yolo_car_hold_frames = max(
                     0,
-                    self._prealign_yolo_hold_frames - 1,
+                    self._prealign_yolo_car_hold_frames - 1,
                 )
-            yolo_ready = self._prealign_yolo_hold_frames > 0
+            yolo_ready = self._prealign_yolo_car_hold_frames > 0
             minimum_drive_end = (
                 max(0.0, self.config.prealign_steer_settle_s)
                 + max(0.0, self.config.prealign_min_drive_s)
@@ -618,23 +815,32 @@ class TParkingPlanner:
                     1 if initial_steering > 0 else -1 if initial_steering < 0 else 0
                 )
                 self._last_entry_steering = initial_steering
-                self._enter(ParkingState.VERIFY_SLOT_BOX, now)
-                return self._stop("prealign_sensor_crosscheck_ready", held_path)
+                self._lidar_y0_terminal_armed = True
+                self._enter(ParkingState.FOLLOW_ENTRY_CURVE, now)
+                self._last_entry_path = prealign_path
+                self._last_entry_car_only = self._car_only_guidance(geometry)
+                self._entry_path_loss_frames = 0
+                self._entry_path_lost_at = None
+                self._reverse_start_pending = True
+                return self._stop(
+                    "prealign_sensor_crosscheck_ready:reverse_path_armed",
+                    prealign_path,
+                )
             if ready:
                 reason = "prealign_bev_path_confirming:%d/%d" % (
                     self._prealign_aligned_frames,
                     max(1, self.config.prealign_confirm_frames),
                 )
             elif not self._prealign_lidar_gate_latched:
-                reason = "prealign_waiting_for_lidar_gate:%s bearing=%s/%.1f" % (
-                    "FRESH" if fresh_pair else "HOLD",
-                    "-" if first_car_bearing is None else "%.1f" % first_car_bearing,
-                    self.config.prealign_first_car_bearing_min_deg,
+                reason = "prealign_waiting_for_lidar_cars:%d/2 scans=%d/%d" % (
+                    lidar.car_count,
+                    self._prealign_lidar_confirm_scans,
+                    max(1, self.config.prealign_lidar_confirm_scans),
                 )
             elif not yolo_ready:
-                reason = "prealign_waiting_for_yolo_lines:%d/%d" % (
-                    geometry.observed_line_count,
-                    max(1, self.config.prealign_yolo_min_lines),
+                reason = "prealign_waiting_for_yolo_cars:%d/%d" % (
+                    geometry.observed_car_count,
+                    max(1, self.config.prealign_yolo_min_cars),
                 )
             elif not current_path_ready:
                 reason = "prealign_waiting_for_current_bev_path"
@@ -659,6 +865,10 @@ class TParkingPlanner:
             return self._stop("lidar_slot_box_verified")
 
         path = self.path_generator.generate(geometry)
+
+        lidar_y0_plan = self._lidar_y0_terminal_plan(geometry, lidar, now, path)
+        if lidar_y0_plan is not None:
+            return lidar_y0_plan
 
         if self.state == ParkingState.PLAN_REVERSE_PATH:
             if self._expired(now, self.config.path_timeout_s):
@@ -705,7 +915,9 @@ class TParkingPlanner:
                 self._last_entry_steering = initial_steering
             self._enter(ParkingState.FOLLOW_ENTRY_CURVE, now)
             self._last_entry_path = path
+            self._last_entry_car_only = self._car_only_guidance(geometry)
             self._entry_path_loss_frames = 0
+            self._entry_path_lost_at = None
             return self._stop("reverse_path_armed", path)
 
         if self.state == ParkingState.CORRECT_FORWARD:
@@ -715,26 +927,57 @@ class TParkingPlanner:
             return self._correction_reverse_plan(geometry, path, now)
 
         if self.state == ParkingState.FOLLOW_ENTRY_CURVE:
-            if self._expired(now, self.config.entry_curve_timeout_s):
-                return self._abort(now, "entry_curve_timeout")
             path_coasting = False
-            if path.found:
+            car_only_guidance = self._car_only_guidance(geometry)
+            guidance_live = (
+                path.found
+                and self._full_geometry_usable(geometry)
+                and not geometry.coasted
+            )
+            if self._reverse_start_pending:
+                if not guidance_live:
+                    self._pause_path_timeout(now)
+                    return self._stop(
+                        "reverse_start_waiting_for_live_path",
+                        self._last_entry_path,
+                    )
+                self._reverse_start_pending = False
+            if guidance_live:
+                self._resume_path_timeout(now)
                 self._last_entry_path = path
+                self._last_entry_car_only = car_only_guidance
                 self._entry_path_loss_frames = 0
+                self._entry_path_lost_at = None
             else:
                 self._aligned_frames = 0
                 self._entry_path_loss_frames += 1
                 if (
                     self._last_entry_path is not None
-                    and self._entry_path_loss_frames
-                    <= max(0, self.config.entry_path_loss_grace_frames)
+                    and self._entry_path_loss_elapsed(now)
+                    <= max(0.0, self.config.entry_path_loss_grace_s)
                 ):
                     path = self._last_entry_path
                     path_coasting = True
+                    car_only_guidance = self._last_entry_car_only
                 else:
                     self._entry_heading_ready_frames = 0
-                    return self._stop("entry_curve_path_lost:%s" % path.reason, path)
-            stop = None if path_coasting else self._stop_at_back_line(geometry, now, path)
+                    reason = geometry.reason if path.found else path.reason
+                    self._pause_path_timeout(now)
+                    return self._stop("entry_curve_path_lost:%s" % reason, path)
+            if (
+                not self._lidar_y0_terminal_armed
+                and self._expired(now, self.config.entry_curve_timeout_s)
+            ):
+                return self._abort(now, "entry_curve_timeout")
+            entry_speed = self._reverse_speed(
+                self.config.reverse_entry_speed,
+                car_only_guidance,
+            )
+            stop = (
+                None
+                if path_coasting or car_only_guidance or self._lidar_y0_terminal_armed
+                else self._stop_at_back_line(geometry, now, path)
+            )
             if stop is not None:
                 return stop
             if self._reverse_entry_mode == "lidar_box_curve":
@@ -769,13 +1012,7 @@ class TParkingPlanner:
                     )
 
                 if virtual_left_entry and not self._reverse_entry_unwinding:
-                    release_ready = (
-                        not path_coasting
-                        and abs(geometry.heading_error_deg)
-                        <= self.config.reverse_entry_release_heading_deg
-                        and abs(geometry.lateral_error_norm)
-                        <= self.config.aligned_lateral_norm
-                    )
+                    release_ready = guidance_live and not path_coasting
                     self._entry_heading_ready_frames = (
                         self._entry_heading_ready_frames + 1
                         if release_ready
@@ -785,7 +1022,7 @@ class TParkingPlanner:
                         steering = self._fixed_right_entry_steering()
                         self._last_entry_steering = steering
                         return self._drive(
-                            self.config.reverse_entry_speed,
+                            entry_speed,
                             steering,
                             (
                                 "following_entry_virtual_left_max_right:"
@@ -810,6 +1047,21 @@ class TParkingPlanner:
                         left_ultrasonic_mm,
                         right_ultrasonic_mm,
                     )
+                    unwind_limit = min(
+                        abs(int(self.config.max_steering)),
+                        abs(int(self.config.reverse_entry_unwind_max_steering)),
+                    )
+                    steering = int(clip(steering, -unwind_limit, unwind_limit))
+                    real_three_line = (
+                        geometry.selection_mode == "three_line_after_car"
+                        and not geometry.coasted
+                        and all(
+                            line is not None and line.mask_index >= 0
+                            for line in (geometry.left, geometry.right, geometry.back)
+                        )
+                    )
+                    if steering < 0 and not real_three_line:
+                        steering = 0
                 elif self.config.reverse_entry_continuous_steering:
                     steering = self._entry_curve_steering(
                         path,
@@ -823,7 +1075,11 @@ class TParkingPlanner:
                 if not path_coasting:
                     self._last_entry_steering = steering
 
-                heading_ready = not path_coasting and self._slot_aligned(geometry)
+                heading_ready = (
+                    not path_coasting
+                    and not car_only_guidance
+                    and self._slot_aligned(geometry)
+                )
                 self._entry_heading_ready_frames = (
                     self._entry_heading_ready_frames + 1
                     if heading_ready
@@ -838,7 +1094,10 @@ class TParkingPlanner:
                     self._last_entry_steering = center_steering
                     self._enter(ParkingState.FOLLOW_SLOT_CENTER, now)
                     return self._drive(
-                        self.config.reverse_center_speed,
+                        self._reverse_speed(
+                            self.config.reverse_center_speed,
+                            car_only_guidance,
+                        ),
                         center_steering,
                         "following_slot_center:entry_aligned_released",
                         path,
@@ -851,12 +1110,12 @@ class TParkingPlanner:
                     else "fixed_max_right"
                 )
                 if path_coasting:
-                    phase += "_coast:%d/%d" % (
-                        self._entry_path_loss_frames,
-                        max(0, self.config.entry_path_loss_grace_frames),
+                    phase += "_coast:%.2f/%.2fs" % (
+                        self._entry_path_loss_elapsed(now),
+                        max(0.0, self.config.entry_path_loss_grace_s),
                     )
                 return self._drive(
-                    self.config.reverse_entry_speed,
+                    entry_speed,
                     steering,
                     (
                         "following_entry_%s:heading=%+.1f steer=%+d confirm=%d/%d"
@@ -870,12 +1129,15 @@ class TParkingPlanner:
                     ),
                     path,
                 )
-            aligned = self._slot_aligned(geometry)
+            aligned = not car_only_guidance and self._slot_aligned(geometry)
             self._aligned_frames = self._aligned_frames + 1 if aligned else 0
             if self._aligned_frames >= max(1, self.config.aligned_confirm_frames):
                 self._enter(ParkingState.FOLLOW_SLOT_CENTER, now)
                 return self._drive(
-                    self.config.reverse_center_speed,
+                    self._reverse_speed(
+                        self.config.reverse_center_speed,
+                        car_only_guidance,
+                    ),
                     self._path_steering(
                         path,
                         left_ultrasonic_mm,
@@ -885,7 +1147,7 @@ class TParkingPlanner:
                     path,
                 )
             return self._drive(
-                self.config.reverse_entry_speed,
+                entry_speed,
                 self._entry_curve_steering(
                     path,
                     left_ultrasonic_mm,
@@ -896,12 +1158,25 @@ class TParkingPlanner:
             )
 
         if self.state == ParkingState.FOLLOW_SLOT_CENTER:
-            if path.found:
-                stop = self._stop_at_back_line(geometry, now, path)
+            car_only_guidance = self._car_only_guidance(geometry)
+            guidance_live = (
+                path.found
+                and self._full_geometry_usable(geometry)
+                and not geometry.coasted
+            )
+            if guidance_live:
+                self._resume_path_timeout(now)
+                stop = (
+                    None
+                    if car_only_guidance or self._lidar_y0_terminal_armed
+                    else self._stop_at_back_line(geometry, now, path)
+                )
                 if stop is not None:
                     return stop
                 self._last_entry_path = path
+                self._last_entry_car_only = car_only_guidance
                 self._entry_path_loss_frames = 0
+                self._entry_path_lost_at = None
                 center_steering = self._path_steering(
                     path,
                     left_ultrasonic_mm,
@@ -912,25 +1187,32 @@ class TParkingPlanner:
                 self._entry_path_loss_frames += 1
                 if (
                     self._last_entry_path is None
-                    or self._entry_path_loss_frames
-                    > max(0, self.config.entry_path_loss_grace_frames)
+                    or self._entry_path_loss_elapsed(now)
+                    > max(0.0, self.config.entry_path_loss_grace_s)
                 ):
+                    self._pause_path_timeout(now)
                     return self._stop("slot_center_path_lost:%s" % path.reason, path)
                 path = self._last_entry_path
+                car_only_guidance = self._last_entry_car_only
                 center_steering = self._last_entry_steering
                 return self._drive(
-                    self.config.reverse_center_speed,
+                    self._reverse_speed(
+                        self.config.reverse_center_speed,
+                        car_only_guidance,
+                    ),
                     center_steering,
-                    "following_slot_center_path_coast:%d/%d"
+                    "following_slot_center_path_coast:%.2f/%.2fs"
                     % (
-                        self._entry_path_loss_frames,
-                        max(0, self.config.entry_path_loss_grace_frames),
+                        self._entry_path_loss_elapsed(now),
+                        max(0.0, self.config.entry_path_loss_grace_s),
                     ),
                     path,
                 )
             if self._aligned_reverse_started_at is None:
                 fresh_pair_aligned = (
-                    lidar.gap_pair_observed
+                    not car_only_guidance
+                    and not self._lidar_y0_terminal_armed
+                    and lidar.gap_pair_observed
                     and lidar.car_count >= 2
                     and not lidar.coasted
                     and self._slot_aligned(geometry)
@@ -972,17 +1254,30 @@ class TParkingPlanner:
                     )
                 self._last_entry_steering = self._straight_steering()
                 return self._drive(
-                    self.config.reverse_aligned_speed,
+                    self._reverse_speed(
+                        self.config.reverse_aligned_speed,
+                        car_only_guidance,
+                    ),
                     self._last_entry_steering,
                     "following_slot_center:aligned_straight",
                     path,
                 )
-            if self._expired(now, self.config.center_follow_timeout_s):
+            if (
+                not self._lidar_y0_terminal_armed
+                and self._expired(now, self.config.center_follow_timeout_s)
+            ):
                 return self._abort(now, "slot_center_follow_timeout")
-            if self._parking_correction_ready(geometry, now):
+            if (
+                not car_only_guidance
+                and not self._lidar_y0_terminal_armed
+                and self._parking_correction_ready(geometry, now)
+            ):
                 return self._start_parking_correction(geometry, path, now)
             return self._drive(
-                self.config.reverse_center_speed,
+                self._reverse_speed(
+                    self.config.reverse_center_speed,
+                    car_only_guidance,
+                ),
                 center_steering,
                 "following_slot_center:local_target",
                 path,
@@ -998,6 +1293,69 @@ class TParkingPlanner:
             and geometry.depth_remaining_px is not None
             and geometry.confidence >= self.config.geometry_confidence_min
         )
+
+    @staticmethod
+    def _car_only_guidance(geometry: ParkingGeometry) -> bool:
+        return geometry.selection_mode in ("car_only_left", "car_only_right")
+
+    def _lidar_y0_terminal_plan(
+        self,
+        geometry: ParkingGeometry,
+        lidar: LidarParkingObservation,
+        now: float,
+        path: ReversePath,
+    ) -> Optional[ParkingPlan]:
+        if self.state not in (
+            ParkingState.FOLLOW_ENTRY_CURVE,
+            ParkingState.FOLLOW_SLOT_CENTER,
+        ):
+            return None
+        if not self._lidar_y0_terminal_armed:
+            return None
+
+        band = max(0.0, self.config.lidar_y0_band_half_width_mm)
+        deadband = max(0.0, self.config.lidar_evasion_center_deadband_mm)
+        at_y0 = tuple(
+            cluster
+            for cluster in lidar.side_car_clusters
+            if cluster.y_back_min_mm <= band
+            and cluster.y_back_max_mm >= -band
+        )
+        left_seen = any(
+            cluster.center_x_right_mm <= -deadband for cluster in at_y0
+        )
+        right_seen = any(
+            cluster.center_x_right_mm >= deadband for cluster in at_y0
+        )
+        if left_seen and right_seen:
+            self._lidar_y0_both_sides_seen = True
+
+        if lidar.timestamp == self._lidar_y0_last_timestamp:
+            return None
+        self._lidar_y0_last_timestamp = lidar.timestamp
+        if not self._lidar_y0_both_sides_seen:
+            return None
+
+        self._lidar_y0_clear_scans = (
+            self._lidar_y0_clear_scans + 1
+            if not left_seen or not right_seen
+            else 0
+        )
+        if self._lidar_y0_clear_scans < max(
+            1,
+            self.config.lidar_y0_clear_confirm_scans,
+        ):
+            return None
+
+        self._straight_exit_after_lidar_y0_clear = True
+        self._enter(ParkingState.PARKED, now)
+        return self._stop("lidar_y0_one_side_cleared", path)
+
+    def _reverse_speed(self, speed: int, car_only_guidance: bool) -> int:
+        if not car_only_guidance:
+            return int(speed)
+        ratio = clip(self.config.car_only_speed_ratio, 0.0, 1.0)
+        return int(round(float(speed) * ratio))
 
     @staticmethod
     def _camera_guidance_usable(geometry: ParkingGeometry) -> bool:
@@ -1108,12 +1466,17 @@ class TParkingPlanner:
     ) -> ParkingPlan:
         if not path.found:
             return self._stop("correction_reverse_path_lost:%s" % path.reason, path)
-        stop = self._stop_at_back_line(geometry, now, path)
+        car_only_guidance = self._car_only_guidance(geometry)
+        stop = (
+            None
+            if car_only_guidance
+            else self._stop_at_back_line(geometry, now, path)
+        )
         if stop is not None:
             return stop
         steering = self._correction_steering(geometry, path)
         self._correction_reverse_steering = steering
-        if self._slot_aligned(geometry):
+        if not car_only_guidance and self._slot_aligned(geometry):
             self._enter(ParkingState.FOLLOW_SLOT_CENTER, now)
             return self._drive(
                 self.config.reverse_center_speed,
@@ -1130,13 +1493,19 @@ class TParkingPlanner:
         ):
             self._enter(ParkingState.FOLLOW_ENTRY_CURVE, now)
             return self._drive(
-                self.config.reverse_entry_speed,
+                self._reverse_speed(
+                    self.config.reverse_entry_speed,
+                    car_only_guidance,
+                ),
                 self._entry_curve_steering(path),
                 "parking_correction_reverse_complete:resume_entry_curve",
                 path,
             )
         return self._drive(
-            -abs(int(self.config.correction_reverse_speed)),
+            self._reverse_speed(
+                -abs(int(self.config.correction_reverse_speed)),
+                car_only_guidance,
+            ),
             steering,
             "parking_correction_reverse",
             path,
@@ -1310,6 +1679,10 @@ class TParkingPlanner:
         limit = abs(int(self.config.max_steering))
         return int(clip(self.config.straight_steering_trim, -limit, limit))
 
+    def _initial_search_steering(self) -> int:
+        limit = abs(int(self.config.max_steering))
+        return int(clip(self.config.initial_search_steering_trim, -limit, limit))
+
     def _prealign_drive(
         self,
         elapsed: float,
@@ -1375,11 +1748,58 @@ class TParkingPlanner:
         entry_bearing = degrees(atan2(target_x, target_y))
         return slot_heading, entry_bearing, target_distance, center_x
 
+    def _lidar_recovery_hold_reason(
+        self,
+        lidar: LidarParkingObservation,
+    ) -> Optional[str]:
+        if not lidar.valid:
+            self._lidar_recovery_required = True
+            self._lidar_resume_scans = 0
+            self._lidar_resume_last_timestamp = None
+            if self.state == ParkingState.PREALIGN_LEFT:
+                self._prealign_lidar_gate_latched = False
+                self._prealign_lidar_confirm_scans = 0
+                self._prealign_lidar_last_timestamp = None
+            return "lidar_unavailable:%s" % lidar.reason
+
+        if not self._lidar_recovery_required:
+            return None
+
+        if lidar.timestamp != self._lidar_resume_last_timestamp:
+            self._lidar_resume_last_timestamp = lidar.timestamp
+            self._lidar_resume_scans += 1
+        required_scans = max(1, self.config.lidar_resume_confirm_scans)
+        if self._lidar_resume_scans < required_scans:
+            return "lidar_resume_check:%d/%d" % (
+                self._lidar_resume_scans,
+                required_scans,
+            )
+
+        self._lidar_recovery_required = False
+        self._lidar_resume_scans = 0
+        self._lidar_resume_last_timestamp = None
+        return None
+
     def _expired(self, now: float, timeout_s: float) -> bool:
         return timeout_s > 0.0 and now - self._state_started_at >= timeout_s
 
     def _state_elapsed(self, now: float) -> float:
         return max(0.0, now - self._state_started_at)
+
+    def _entry_path_loss_elapsed(self, now: float) -> float:
+        if self._entry_path_lost_at is None:
+            self._entry_path_lost_at = now
+        return max(0.0, now - self._entry_path_lost_at)
+
+    def _pause_path_timeout(self, now: float) -> None:
+        if self._entry_timeout_paused_at is None:
+            self._entry_timeout_paused_at = now
+
+    def _resume_path_timeout(self, now: float) -> None:
+        if self._entry_timeout_paused_at is None:
+            return
+        self._state_started_at += max(0.0, now - self._entry_timeout_paused_at)
+        self._entry_timeout_paused_at = None
 
     def _enter(self, state: ParkingState, now: float) -> None:
         self.state = state
@@ -1388,10 +1808,12 @@ class TParkingPlanner:
         self._prealign_aligned_frames = 0
         self._prealign_last_path = None
         self._prealign_path_age_frames = 0
-        self._prealign_yolo_hold_frames = 0
+        self._prealign_yolo_car_hold_frames = 0
         self._prealign_gap_acquired_at = None
         self._reverse_path_confirm_frames = 0
         self._entry_heading_ready_frames = 0
+        self._entry_path_lost_at = None
+        self._entry_timeout_paused_at = None
         self._aligned_reverse_started_at = None
 
     def _abort(self, now: float, reason: str) -> ParkingPlan:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import atan2, cos, degrees, hypot, radians, sin, sqrt
+from statistics import median
 from typing import List, Optional, Sequence, Tuple
 
 from ..sensors.lidar import LidarPoint, LidarScan
@@ -177,7 +178,9 @@ class LidarParkingObservation:
     entry_error_mm: Optional[float] = None
     entry_reached: bool = False
     nearest_safety_mm: Optional[float] = None
+    safety_center_x_right_mm: Optional[float] = None
     car_clusters: Tuple[CarCluster, ...] = ()
+    side_car_clusters: Tuple[CarCluster, ...] = ()
     coasted: bool = False
     reason: str = "no_scan"
 
@@ -285,13 +288,41 @@ class LidarParkingSpaceEstimator:
             (summarize_cluster(points) for points in cluster_points_list),
             key=lambda cluster: cluster.y_back_min_mm,
         ))
+        side_roi = self.config.slot_tracking_roi or cluster_roi
+        side_clusters = (
+            clusters
+            if side_roi == cluster_roi
+            else tuple(
+                sorted(
+                    (
+                        summarize_cluster(points)
+                        for points in cluster_points(
+                            [
+                                point
+                                for point in transformed
+                                if side_roi.contains(point[0], point[1])
+                            ],
+                            self.config.car_cluster_radius_mm,
+                            self.config.car_cluster_min_points,
+                        )
+                    ),
+                    key=lambda cluster: cluster.y_back_min_mm,
+                )
+            )
+        )
         new_scan = self._last_timestamp != scan.timestamp
-        safety_distances = [
-            hypot(x_right, y_back)
+        safety_points = [
+            (x_right, y_back)
             for x_right, y_back in transformed
             if self.config.safety_roi.contains(x_right, y_back)
         ]
+        safety_distances = [hypot(x_right, y_back) for x_right, y_back in safety_points]
         nearest_safety = min(safety_distances) if safety_distances else None
+        safety_center_x = (
+            median(x_right for x_right, _ in safety_points)
+            if safety_points
+            else None
+        )
         if new_scan:
             self._unsafe_scans = self._unsafe_scans + 1 if nearest_safety is not None else 0
         unsafe = self._unsafe_scans >= max(1, self.config.safety_confirm_scans)
@@ -471,7 +502,9 @@ class LidarParkingSpaceEstimator:
             entry_error_mm=entry_error,
             entry_reached=entry_reached,
             nearest_safety_mm=nearest_safety,
+            safety_center_x_right_mm=safety_center_x,
             car_clusters=clusters,
+            side_car_clusters=side_clusters,
             coasted=coasted,
             reason=reason,
         )

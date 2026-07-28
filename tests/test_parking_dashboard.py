@@ -2,12 +2,15 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from skku_autocar.estimation.parking_geometry import ParkingGeometry
+from skku_autocar.planning.t_parking_planner import ParkingState
 from skku_autocar.runtime.parking_app import (
     DashboardVideoRecorder,
     compose_parking_dashboard,
     dashboard_recording_enabled,
+    draw_bev_maneuver_path,
     filter_bev_visible_line_masks,
     parking_goal_visibility,
     parking_slot_mode_label,
@@ -94,6 +97,22 @@ class ParkingDashboardTest(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         self.assertIs(result[0], visible)
+
+    def test_right_steering_preview_bends_left_in_rear_bev(self):
+        image = self.np.zeros((200, 200, 3), dtype=self.np.uint8)
+        plan = SimpleNamespace(
+            path=None,
+            state=ParkingState.FOLLOW_ENTRY_CURVE,
+            command=SimpleNamespace(steering=150),
+        )
+        geometry = ParkingGeometry(vehicle_x_px=100.0, vehicle_y_px=180.0)
+
+        draw_bev_maneuver_path(self.cv2, self.np, image, plan, geometry)
+
+        red = (image[:, :, 2] > 150) & (image[:, :, 1] < 100)
+        ys, xs = self.np.nonzero(red)
+        self.assertTrue(self.np.any(ys < 45))
+        self.assertLess(float(self.np.median(xs[ys < 45])), 100.0)
 
     def test_recorder_writes_readable_dashboard_mp4(self):
         with tempfile.TemporaryDirectory() as directory:
