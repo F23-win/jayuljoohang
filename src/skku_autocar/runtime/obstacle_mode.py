@@ -20,7 +20,12 @@ from ..planning.obstacle_fusion import (
     ObstacleFusionConfig,
     ObstacleFusionPlanner,
 )
-from ..sensors.ultrasonic import UltrasonicConfig, UltrasonicFilter
+from ..sensors.ultrasonic import (
+    FRONT_KEYS,
+    UltrasonicConfig,
+    UltrasonicFilter,
+    UltrasonicSnapshot,
+)
 from ..types import ControlCommand
 
 
@@ -61,6 +66,7 @@ class ObstacleDriveMode:
         self._planner = ObstacleFusionPlanner(build_obstacle_fusion_config(args))
         self._local_map = LocalOccupancyGrid(build_local_occupancy_config(args))
         self._ultrasonic = UltrasonicFilter(build_ultrasonic_config(args))
+        self._ultrasonic_replay: Optional[UltrasonicSnapshot] = None
         self._result: Optional[LaneChangeResult] = None
         self._last_output_lane: Optional[LaneGeometry] = None
         self._last_reliable_output_lane: Optional[LaneGeometry] = None
@@ -91,14 +97,33 @@ class ObstacleDriveMode:
     def blocks_light_stop(self) -> bool:
         return self._frame.blocks_light_stop
 
-    def validate_runtime(self, segmenter: Any, no_serial: bool) -> None:
+    @property
+    def lane_reacquire_active(self) -> bool:
+        return self.enabled and self._lane_change.avoidance_reacquire_active
+
+    @property
+    def lane_reacquire_target_lane(self) -> Optional[int]:
+        if not self.enabled:
+            return None
+        return self._lane_change.avoidance_target_lane
+
+    def validate_runtime(
+        self,
+        segmenter: Any,
+        no_serial: bool,
+        has_ultrasonic_replay: bool = False,
+    ) -> None:
         if not self.enabled:
             return
         if not segmenter.has_obstacle_class:
             LOG.warning(
                 "model has no 'obstacle' class; obstacle fusion cannot request a lane change"
             )
-        if no_serial and self._planner.config.fusion_mode == "fused":
+        if (
+            no_serial
+            and self._planner.config.fusion_mode == "fused"
+            and not has_ultrasonic_replay
+        ):
             LOG.warning(
                 "fused obstacle mode requires Arduino ultrasonic data; "
                 "use --obstacle-fusion-mode yolo for video replay"
@@ -115,6 +140,19 @@ class ObstacleDriveMode:
     def accept_serial_lines(self, lines: Sequence[str], now: float) -> None:
         if self.enabled:
             self._ultrasonic.update_lines(lines, now)
+
+    def accept_replay_front(self, front_mm: Optional[int]) -> None:
+        """Inject one already-filtered front value for an offline video frame."""
+        if not self.enabled:
+            return
+        value = 0 if front_mm is None else max(0, int(front_mm))
+        self._ultrasonic_replay = UltrasonicSnapshot(
+            fc=value,
+            fr=value,
+            fl=value,
+            fresh_keys=FRONT_KEYS,
+            age_seconds=0.0,
+        )
 
     def stop_serial(self, vehicle: Any) -> None:
         if self.enabled:
@@ -193,13 +231,18 @@ class ObstacleDriveMode:
             frame_center_masks=class_masks.center,
             frame_side_masks=class_masks.side,
         )
+        ultrasonic = (
+            self._ultrasonic_replay
+            if self._ultrasonic_replay is not None
+            else self._ultrasonic.snapshot(now)
+        )
         event = self._planner.update(
             planning_masks,
             bev.shape,
             self._corridor_estimator.last_centerline_bev,
             lane,
             self._lane_change,
-            self._ultrasonic.snapshot(now),
+            ultrasonic,
             now,
             running,
             frame_obstacle_masks=class_masks.obstacle,
@@ -415,6 +458,9 @@ def build_lane_change_config(args: argparse.Namespace) -> LaneChangeConfig:
         target_capture_frames=args.lane_change_target_capture_frames,
         allow_virtual_stabilize=args.lane_change_allow_virtual_stabilize == "on",
         smooth_avoidance=False,
+        require_observed_target_lane=(
+            getattr(args, "lane_change_require_observed_target", "off") == "on"
+        ),
         return_duration_scale=args.lane_change_return_duration_scale,
         return_steering_cap=args.lane_change_return_steering_cap,
         return_stabilizing_steering_cap=(
@@ -627,6 +673,14 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         help="fused uses YOLO and ultrasonic confirmation; yolo is for video replay",
     )
     group.add_argument(
+        "--obstacle-ultrasonic-trace",
+        default="",
+        help=(
+            "frame-aligned front_mm CSV for fused offline video replay; "
+            "live driving leaves this empty"
+        ),
+    )
+    group.add_argument(
         "--obstacle-local-map",
         choices=("on", "off"),
         default="on",
@@ -689,6 +743,15 @@ def add_obstacle_arguments(parser: argparse.ArgumentParser) -> None:
         "--lane-change-allow-virtual-stabilize",
         choices=("on", "off"),
         default="off",
+    )
+    group.add_argument(
+        "--lane-change-require-observed-target",
+        choices=("on", "off"),
+        default="off",
+        help=(
+            "require a physical target-lane corridor before avoidance can enter "
+            "stabilization"
+        ),
     )
 
     obstacle_specs = (

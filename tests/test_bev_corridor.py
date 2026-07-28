@@ -474,6 +474,124 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
         self.assertEqual(curved.reason, "corridor_tier1")
         self.assertNotIn("center_jump", curved.reason)
 
+    def test_obstacle_lane_change_reacquires_low_confidence_tier1_jump(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                min_lane_width_px=40.0,
+                max_lane_width_px=100.0,
+                max_center_jump_px=5.0,
+                trusted_tier1_min_confidence=0.80,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                path_smooth_alpha=1.0,
+                path_max_step_px=200.0,
+                max_coast_frames=0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+        before = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(40)],
+                side=[line_mask(100)],
+                center_conf=1.0,
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        reacquired = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(150)],
+                side=[line_mask(90)],
+                center_conf=0.45,
+                side_conf=0.45,
+                shape=(100, 200),
+            ),
+            lane_change_target_lane=1,
+        )
+
+        self.assertEqual(
+            reacquired.reason,
+            "corridor_tier1:target_lane1:lane_change_reacquired",
+        )
+        self.assertEqual(estimator.last_class_name, "left-side+center")
+        self.assertGreater(reacquired.center_x, before.center_x + 40.0)
+
+    def test_lane1_target_uses_real_left_side_and_center_corridor(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                min_lane_width_px=40.0,
+                max_lane_width_px=100.0,
+                centerline_bias=0.5,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                path_smooth_alpha=1.0,
+                vehicle_center_x_offset_ratio=0.0,
+            )
+        )
+
+        target = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(100)],
+                side=[line_mask(40), line_mask(160)],
+                center_conf=0.95,
+                side_conf=0.95,
+                shape=(100, 200),
+            ),
+            lane_change_target_lane=1,
+        )
+
+        self.assertEqual(target.reason, "corridor_tier1:target_lane1")
+        self.assertEqual(estimator.last_class_name, "left-side+center")
+        self.assertAlmostEqual(target.center_x, 71.5, delta=0.5)
+
+    def test_obstacle_lane_change_reacquire_never_bypasses_crosswalk_transit(self):
+        estimator = BevCorridorLaneEstimator(
+            BevCorridorConfig(
+                lane_width_px=60.0,
+                min_lane_width_px=40.0,
+                max_lane_width_px=100.0,
+                max_center_jump_px=5.0,
+                crosswalk_recovery_max_center_jump_px=5.0,
+                trusted_tier1_min_confidence=0.80,
+                center_smooth_alpha=1.0,
+                heading_smooth_alpha=1.0,
+                path_smooth_alpha=1.0,
+                path_max_step_px=200.0,
+                max_coast_frames=0,
+                vehicle_center_x_offset_ratio=0.0,
+                crosswalk_transit_enabled=True,
+            )
+        )
+        before = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(40)],
+                side=[line_mask(100)],
+                center_conf=1.0,
+                side_conf=1.0,
+                shape=(100, 200),
+            )
+        )
+
+        during = estimator.estimate(
+            BevClassMasks(
+                center=[line_mask(90)],
+                side=[line_mask(150)],
+                crosswalk=[crosswalk_mask()],
+                center_conf=0.40,
+                side_conf=0.40,
+                crosswalk_conf=1.0,
+                shape=(100, 200),
+            ),
+            lane_change_target_lane=1,
+        )
+
+        self.assertTrue(during.reason.startswith("crosswalk_transit_hold:"))
+        self.assertNotIn("lane_change_reacquired", during.reason)
+        self.assertAlmostEqual(during.center_x, before.center_x, delta=0.2)
+
     def test_virtual_hold_preserves_last_curve_direction(self):
         estimator = BevCorridorLaneEstimator(
             BevCorridorConfig(

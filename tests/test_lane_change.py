@@ -53,6 +53,39 @@ def lane_for_target_error(lateral_error_norm=0.0, heading=0.0, lane_width_px=150
     )
 
 
+def observed_lane1(
+    lateral_error_norm=0.0,
+    near_lateral_error_norm=None,
+    heading=0.0,
+    bev_width_px=800.0,
+):
+    vehicle_center_x = 400.0
+    half_width = bev_width_px / 2.0
+    center_x = vehicle_center_x + lateral_error_norm * half_width
+    near_error = (
+        lateral_error_norm
+        if near_lateral_error_norm is None
+        else near_lateral_error_norm
+    )
+    near_center_x = vehicle_center_x + near_error * half_width
+    return LaneGeometry(
+        found=True,
+        center_x=center_x,
+        vehicle_center_x=vehicle_center_x,
+        target_y=200.0,
+        lateral_error_px=center_x - vehicle_center_x,
+        lateral_error_norm=lateral_error_norm,
+        heading_error=heading,
+        confidence=1.0,
+        reason="corridor_tier1:target_lane1:lane_change_reacquired",
+        height=500.0,
+        near_center_x=near_center_x,
+        near_target_y=440.0,
+        near_lateral_error_px=near_center_x - vehicle_center_x,
+        near_lateral_error_norm=near_error,
+    )
+
+
 class LaneChangeControllerTest(unittest.TestCase):
     def setUp(self):
         self.controller = LaneChangeController(
@@ -510,6 +543,208 @@ class LaneChangeControllerTest(unittest.TestCase):
 
         self.assertEqual(unreliable.state, "armed")
         self.assertEqual(reliable.state, "changing_to_lane1")
+
+    def test_only_committed_avoidance_requests_lane_reacquisition(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(mode="external")
+        )
+        self.controller.request_avoidance("obstacle_fusion")
+
+        self.assertFalse(self.controller.avoidance_reacquire_active)
+
+        self.controller.update(
+            lane(),
+            150.0,
+            800.0,
+            0.0,
+            True,
+            lane_reliable=True,
+        )
+
+        self.assertTrue(self.controller.avoidance_reacquire_active)
+
+    def test_reacquired_target_lane_releases_forced_avoidance_steering(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                target_lane_width_px=150.0,
+                target_capture_frames=1,
+                stable_required_frames=5,
+                steering_min=150,
+                steering_cap=150,
+            )
+        )
+        self.controller.request_avoidance("obstacle_fusion")
+        self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+        reacquired_lane = replace(
+            lane_for_target_error(lateral_error_norm=0.06, heading=0.12),
+            confidence=0.45,
+            reason="corridor_tier1:lane_change_reacquired",
+        )
+
+        captured = self.controller.update(
+            reacquired_lane,
+            150.0,
+            800.0,
+            0.1,
+            True,
+            lane_reliable=True,
+        )
+        adjusted = self.controller.apply_steering_assist(
+            ControlCommand(speed=255, steering=34, reason="path_tracking"),
+            captured,
+        )
+
+        self.assertEqual(captured.state, "stabilizing_lane1")
+        self.assertEqual(captured.direction, 0)
+        self.assertFalse(self.controller.avoidance_reacquire_active)
+        self.assertEqual(adjusted.steering, 34)
+
+    def test_observed_lane1_corridor_is_not_shifted_twice(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                target_lane_width_px=150.0,
+                target_capture_frames=2,
+                stable_required_frames=5,
+                require_observed_target_lane=True,
+            )
+        )
+        self.controller.request_avoidance("obstacle_fusion")
+        self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+
+        observed = observed_lane1(
+            lateral_error_norm=-0.40,
+            near_lateral_error_norm=-0.45,
+        )
+        result = self.controller.update(
+            observed,
+            150.0,
+            800.0,
+            0.1,
+            True,
+            lane_reliable=True,
+        )
+
+        self.assertEqual(result.state, "changing_to_lane1")
+        self.assertEqual(result.offset_px, 0.0)
+        self.assertEqual(result.lane.center_x, observed.center_x)
+        self.assertTrue(result.lane_reliable)
+
+    def test_unobserved_shifted_path_cannot_confirm_avoidance_arrival(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                target_lane_width_px=150.0,
+                target_capture_frames=1,
+                stable_required_frames=5,
+                require_observed_target_lane=True,
+            )
+        )
+        self.controller.request_avoidance("obstacle_fusion")
+        self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+
+        result = self.controller.update(
+            lane_for_target_error(lateral_error_norm=0.0),
+            150.0,
+            800.0,
+            0.1,
+            True,
+            lane_reliable=True,
+        )
+
+        self.assertEqual(result.state, "changing_to_lane1")
+
+    def test_observed_lane1_requires_near_and_far_capture_frames(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                target_lane_width_px=150.0,
+                target_capture_error=0.20,
+                target_capture_frames=2,
+                stable_required_frames=5,
+                require_observed_target_lane=True,
+            )
+        )
+        self.controller.request_avoidance("obstacle_fusion")
+        self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+
+        far_outside = self.controller.update(
+            observed_lane1(
+                lateral_error_norm=-0.30,
+                near_lateral_error_norm=-0.10,
+            ),
+            150.0,
+            800.0,
+            0.1,
+            True,
+            lane_reliable=True,
+        )
+        first = self.controller.update(
+            observed_lane1(
+                lateral_error_norm=-0.10,
+                near_lateral_error_norm=-0.12,
+            ),
+            150.0,
+            800.0,
+            0.2,
+            True,
+            lane_reliable=True,
+        )
+        captured = self.controller.update(
+            observed_lane1(
+                lateral_error_norm=-0.08,
+                near_lateral_error_norm=-0.10,
+            ),
+            150.0,
+            800.0,
+            0.3,
+            True,
+            lane_reliable=True,
+        )
+
+        self.assertEqual(far_outside.state, "changing_to_lane1")
+        self.assertEqual(first.state, "changing_to_lane1")
+        self.assertEqual(captured.state, "stabilizing_lane1")
+
+    def test_source_lane_becomes_unreliable_translated_fallback_after_capture(self):
+        self.controller = LaneChangeController(
+            LaneChangeConfig(
+                mode="external",
+                target_lane_width_px=150.0,
+                target_capture_frames=3,
+                stable_required_frames=5,
+                require_observed_target_lane=True,
+            )
+        )
+        self.controller.request_avoidance("obstacle_fusion")
+        self.controller.update(lane(), 150.0, 800.0, 0.0, True)
+        observed = self.controller.update(
+            observed_lane1(
+                lateral_error_norm=-0.35,
+                near_lateral_error_norm=-0.40,
+            ),
+            150.0,
+            800.0,
+            0.1,
+            True,
+            lane_reliable=True,
+        )
+
+        held = self.controller.update(
+            lane_for_target_error(lateral_error_norm=0.0),
+            150.0,
+            800.0,
+            0.2,
+            True,
+            lane_reliable=True,
+        )
+
+        self.assertEqual(held.state, "changing_to_lane1")
+        self.assertFalse(held.lane_reliable)
+        self.assertNotEqual(held.lane.center_x, observed.lane.center_x)
+        self.assertAlmostEqual(held.offset_px, -150.0)
+        self.assertIn("lane_change", held.lane.reason)
 
     def test_lane2_keeps_reason_clean_when_no_offset_is_active(self):
         result = self.controller.update(lane(), 150.0, 800.0, 0.0, True)

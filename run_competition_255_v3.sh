@@ -88,6 +88,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/drive.py" \
   --obstacle-visual-commit-frame-y 0.40 \
   --obstacle-range-visual-fallback off \
   --lane-change-target-width-px 160 \
+  --lane-change-require-observed-target on \
   --lane-change-steering-override off \
   --lane-change-steering-min 80 \
   --lane-change-steering-boost 25 \

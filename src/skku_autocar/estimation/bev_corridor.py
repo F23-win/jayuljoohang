@@ -291,12 +291,25 @@ class BevCorridorLaneEstimator:
         self._crosswalk_advance_px: float = 0.0
 
     # ------------------------------------------------------------------
-    def estimate(self, bev: BevClassMasks) -> LaneGeometry:
+    def estimate(
+        self,
+        bev: BevClassMasks,
+        *,
+        lane_change_target_lane: Optional[int] = None,
+    ) -> LaneGeometry:
         """Estimate one stable driving path, including crosswalk transit."""
+        target_lane = (
+            int(lane_change_target_lane)
+            if lane_change_target_lane in (1, 2)
+            else None
+        )
         crosswalk_seen = self._crosswalk_visible(bev)
         self.last_crosswalk_visible = crosswalk_seen
         if not self.config.crosswalk_transit_enabled:
-            return self._estimate_lane(bev)
+            return self._estimate_lane(
+                bev,
+                lane_change_target_lane=target_lane if not crosswalk_seen else None,
+            )
 
         if crosswalk_seen:
             self._crosswalk_transit_remaining = max(
@@ -314,8 +327,11 @@ class BevCorridorLaneEstimator:
         # excluded from center/side fitting, so a reliable visible boundary is
         # better evidence than a vehicle-relative path cached before the car
         # moved onto the zebra. The cache is fallback-only.
-        lane = self._estimate_lane(bev)
         transit_active = crosswalk_seen or self._crosswalk_transit_remaining > 0
+        lane = self._estimate_lane(
+            bev,
+            lane_change_target_lane=target_lane if not transit_active else None,
+        )
 
         if not transit_active:
             self._crosswalk_transit_reliable_frames = 0
@@ -391,7 +407,12 @@ class BevCorridorLaneEstimator:
         )
         return held if held is not None else lane
 
-    def _estimate_lane(self, bev: BevClassMasks) -> LaneGeometry:
+    def _estimate_lane(
+        self,
+        bev: BevClassMasks,
+        *,
+        lane_change_target_lane: Optional[int] = None,
+    ) -> LaneGeometry:
         import numpy as np  # noqa: F401  (kept for import-cost parity / clarity)
 
         self.last_centerline_bev = []
@@ -429,7 +450,14 @@ class BevCorridorLaneEstimator:
         center_fit = self._fit_line(bev.center, bev.shape)
         side_fits = [f for f in (self._fit_line([m], bev.shape) for m in bev.side) if f]
 
-        resolved = self._resolve(center_fit, side_fits, bev, vehicle_center_x, target_y)
+        resolved = self._resolve(
+            center_fit,
+            side_fits,
+            bev,
+            vehicle_center_x,
+            target_y,
+            target_lane=lane_change_target_lane,
+        )
         if resolved is None:
             held = self._hold_crosswalk_lane_if_available("no_corridor")
             if held is not None:
@@ -459,26 +487,49 @@ class BevCorridorLaneEstimator:
             and tier in (1, 2)
             and float(det_conf) >= 0.45
         )
+        observed_target_lane = (
+            (lane_change_target_lane == 1 and class_name == "left-side+center")
+            or (
+                lane_change_target_lane == 2
+                and class_name == "center+right-side"
+            )
+        )
         trusted_tier1_measurement = (
             tier == 1
             and float(det_conf)
             >= float(self.config.trusted_tier1_min_confidence)
+            and (
+                lane_change_target_lane is None
+                or observed_target_lane
+            )
         )
         trusted_measurement = (
             trusted_recovery_measurement
             or trusted_tier1_measurement
         )
+        center_jump = self._is_center_jump(raw_center_x)
+        heading_jump = self._is_heading_jump(raw_heading)
+        lane_change_reacquired = (
+            observed_target_lane
+            and not self.last_crosswalk_visible
+            and self._crosswalk_transit_remaining <= 0
+            and tier == 1
+            and float(det_conf) >= 0.35
+            and (center_jump or heading_jump)
+        )
         if (
-            self._is_center_jump(raw_center_x)
+            center_jump
             and not trusted_measurement
+            and not lane_change_reacquired
         ):
             held = self._hold_crosswalk_lane_if_available("center_jump")
             if held is not None:
                 return held
             return self._coast_or_lost(bev.shape, "center_jump")
         if (
-            self._is_heading_jump(raw_heading)
+            heading_jump
             and not trusted_measurement
+            and not lane_change_reacquired
         ):
             held = self._hold_crosswalk_lane_if_available("heading_jump")
             if held is not None:
@@ -493,6 +544,12 @@ class BevCorridorLaneEstimator:
         self.last_class_name = class_name
         self.last_tier = tier
         current_path = self._fixed_path_points(centerline_fit, bev.shape)
+        if lane_change_reacquired:
+            # The camera has crossed the divider and the adjacent physical
+            # corridor is now the control reference. Do not blend that path with
+            # the old lane's cached geometry.
+            self._smoothed_path = []
+            self._smoothed_heading = None
         self.last_centerline_bev = self._smooth_path(current_path)
         self.last_center_line_bev = self._line_points(left_fit)
         self.last_right_line_bev = self._line_points(right_fit)
@@ -539,6 +596,14 @@ class BevCorridorLaneEstimator:
         # not by corridor width.
         confidence = self._clip(det_conf * tier_base * (0.5 + 0.5 * row_coverage), 0.0, 1.0)
 
+        reason = "corridor_tier%d" % tier
+        if observed_target_lane:
+            reason = "%s:target_lane%d" % (
+                reason,
+                int(lane_change_target_lane),
+            )
+        if lane_change_reacquired:
+            reason = "%s:lane_change_reacquired" % reason
         lane = LaneGeometry(
             found=True,
             center_x=center_x,
@@ -548,7 +613,7 @@ class BevCorridorLaneEstimator:
             lateral_error_norm=lateral_error_norm,
             heading_error=heading_error,
             confidence=confidence,
-            reason="corridor_tier%d" % tier,
+            reason=reason,
             height=float(height),
             near_center_x=near_center_x,
             near_target_y=near_target_y,
@@ -573,6 +638,7 @@ class BevCorridorLaneEstimator:
         bev: BevClassMasks,
         vehicle_center_x: float,
         target_y: float,
+        target_lane: Optional[int] = None,
     ):
         # Crosswalk option B: the right boundary normally remains visible while
         # zebra markings obscure the center line. Drive a fixed distance inward
@@ -587,6 +653,35 @@ class BevCorridorLaneEstimator:
                 return centerline, left, right, 3, "crosswalk-right-side-b", bev.side_conf
             if self._crosswalk_cache_lane is not None:
                 return None
+
+        # During a committed move into lane 1, the center marking becomes the
+        # right boundary and a real side line on its left becomes the outer
+        # boundary. This is the physical adjacent-lane corridor; it replaces the
+        # translated lane-2 path as soon as both boundaries are visible.
+        if target_lane == 1 and center_fit is not None and side_fits:
+            center_x = self._x_at(center_fit, target_y)
+            left = self._select_left_side(side_fits, center_x, target_y)
+            if left is not None:
+                width_px = self._update_width(
+                    center_x - self._x_at(left, target_y)
+                )
+                left_boundary = (
+                    self._bounded_left_boundary(center_fit, left, width_px)
+                    if self.config.center_anchor
+                    else left
+                )
+                # _midline biases toward its second argument. Pass the physical
+                # outer line second to preserve the existing outer-line bias.
+                midline = self._midline(center_fit, left_boundary)
+                if midline is not None:
+                    return (
+                        midline,
+                        left_boundary,
+                        center_fit,
+                        1,
+                        "left-side+center",
+                        bev.center_conf,
+                    )
 
         # Tier 1: center line + a real right-side line.
         if center_fit is not None and side_fits:
@@ -670,6 +765,25 @@ class BevCorridorLaneEstimator:
         if not candidates:
             return None
         # Nearest line to the right of the center line = the boundary of our lane.
+        return min(candidates, key=lambda item: item[0])[1]
+
+    def _select_left_side(
+        self,
+        side_fits: List[dict],
+        center_x: float,
+        target_y: float,
+    ) -> Optional[dict]:
+        candidates = []
+        for fit in side_fits:
+            side_x = self._x_at(fit, target_y)
+            gap = center_x - side_x
+            if gap < self.config.side_min_gap_px:
+                continue
+            candidates.append((gap, fit))
+        if not candidates:
+            return None
+        # Nearest side line to the left of the center marking is lane 1's outer
+        # boundary.
         return min(candidates, key=lambda item: item[0])[1]
 
     def _select_crosswalk_right_side(
@@ -793,6 +907,39 @@ class BevCorridorLaneEstimator:
         bounded_x = np.maximum(
             min_right_x,
             np.minimum(virtual_right_x, detected_right_x),
+        )
+        degree = min(self.config.poly_degree, len(ys) - 1)
+        fit = np.polyfit(ys, bounded_x, degree)
+        points = [(float(x), float(y)) for x, y in zip(bounded_x, ys)]
+        return {
+            "fit": fit,
+            "min_y": float(y0),
+            "max_y": float(y1),
+            "n": len(ys),
+            "points": points,
+        }
+
+    def _bounded_left_boundary(
+        self,
+        center_fit: dict,
+        left_fit: dict,
+        width_px: float,
+    ) -> dict:
+        import numpy as np
+
+        y0 = max(center_fit["min_y"], left_fit["min_y"])
+        y1 = min(center_fit["max_y"], left_fit["max_y"])
+        if y1 - y0 < 1.0:
+            return self._offset(center_fit, -width_px)
+
+        ys = np.linspace(y0, y1, self.config.num_samples)
+        center_x = np.polyval(center_fit["fit"], ys)
+        virtual_left_x = center_x - max(0.0, float(width_px))
+        detected_left_x = np.polyval(left_fit["fit"], ys)
+        max_left_x = center_x - max(1.0, float(self.config.side_min_gap_px))
+        bounded_x = np.minimum(
+            max_left_x,
+            np.maximum(virtual_left_x, detected_left_x),
         )
         degree = min(self.config.poly_degree, len(ys) - 1)
         fit = np.polyfit(ys, bounded_x, degree)

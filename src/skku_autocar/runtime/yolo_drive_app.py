@@ -15,6 +15,7 @@ from ..perception.bev import BevConfig, BevTransformer
 from ..perception.traffic_light import TrafficLightConfig, TrafficLightController, TrafficLightObservation
 from ..perception.yolo_lane import YoloClassMasks, YoloLaneConfig, YoloLaneMask, YoloLaneSegmenter
 from ..planning.yolo_lane_follower import YoloLaneFollower, YoloLaneFollowerConfig
+from ..sensors.ultrasonic_replay import UltrasonicFrontTrace
 from ..types import ControlCommand
 from .obstacle_mode import ObstacleDriveMode, add_obstacle_arguments
 
@@ -83,6 +84,20 @@ def run(args: argparse.Namespace) -> int:
     # A video-file source (not a live camera index) should loop for review instead
     # of erroring out at the end of the clip.
     is_video_file = not str(args.camera).isdigit()
+    ultrasonic_trace = None
+    if args.obstacle_ultrasonic_trace:
+        if not is_video_file:
+            raise RuntimeError(
+                "--obstacle-ultrasonic-trace is only valid with a video file"
+            )
+        ultrasonic_trace = UltrasonicFrontTrace.from_csv(
+            args.obstacle_ultrasonic_trace
+        )
+        LOG.info(
+            "ultrasonic replay trace=%s frames=%d",
+            args.obstacle_ultrasonic_trace,
+            len(ultrasonic_trace.values),
+        )
     ok, first_frame = read_startup_frame(cap, 1 if is_video_file else 5)
     if not ok:
         cap.release()
@@ -146,7 +161,11 @@ def run(args: argparse.Namespace) -> int:
     command = ControlCommand.stop("paused")
 
     LOG.info("model=%s device=%s camera=%s", model_path, segmenter.device, args.camera)
-    obstacle_mode.validate_runtime(segmenter, args.no_serial)
+    obstacle_mode.validate_runtime(
+        segmenter,
+        args.no_serial,
+        has_ultrasonic_replay=ultrasonic_trace is not None,
+    )
     log_effective_config(args, corridor_config, follower_config)
     obstacle_mode.log_configuration(args)
     if recorder.enabled:
@@ -192,6 +211,14 @@ def run(args: argparse.Namespace) -> int:
                 if is_video_file
                 else wall_now
             )
+            if ultrasonic_trace is not None:
+                video_frame_index = max(
+                    0,
+                    int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1,
+                )
+                obstacle_mode.accept_replay_front(
+                    ultrasonic_trace.front_mm(video_frame_index)
+                )
             obstacle_mode.update_serial(vehicle, control_now)
             dt = max(1e-6, wall_now - last_frame_at)
             fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps else 1.0 / dt
@@ -206,7 +233,12 @@ def run(args: argparse.Namespace) -> int:
                 class_masks,
                 include_obstacle=obstacle_mode.enabled,
             )
-            lane = corridor_estimator.estimate(bev)
+            lane = corridor_estimator.estimate(
+                bev,
+                lane_change_target_lane=(
+                    obstacle_mode.lane_reacquire_target_lane
+                ),
+            )
             bev_mask = fuse_masks([*bev.center, *bev.side, *bev.lane, *bev.crosswalk])
             mask_result = corridor_mask_result(class_masks, corridor_estimator, frame.shape)
             lane = obstacle_mode.update(

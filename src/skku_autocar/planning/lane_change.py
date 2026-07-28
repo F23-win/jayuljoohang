@@ -33,6 +33,7 @@ class LaneChangeConfig:
     target_capture_frames: int = 2
     allow_virtual_stabilize: bool = False
     smooth_avoidance: bool = False
+    require_observed_target_lane: bool = False
     return_duration_scale: float = 1.0
     return_steering_cap: int = 0
     return_stabilizing_steering_cap: int = 0
@@ -71,6 +72,7 @@ class LaneChangeController:
         self._return_profile = "normal"
         self._stable_frames = 0
         self._target_capture_frames = 0
+        self._target_lane_observed = False
         self._locked_lane_width_px = None
         self._last_reliable_shifted_lane: Optional[LaneGeometry] = None
         self._last_output_steering: Optional[int] = None
@@ -88,6 +90,7 @@ class LaneChangeController:
         self._return_profile = "normal"
         self._stable_frames = 0
         self._target_capture_frames = 0
+        self._target_lane_observed = False
         self._locked_lane_width_px = None
         self._last_reliable_shifted_lane = None
         self._last_output_steering = None
@@ -108,6 +111,39 @@ class LaneChangeController:
         if self._phase_started_at is not None:
             self._phase_started_at += paused_for
         self._paused_at = None
+
+    @property
+    def avoidance_reacquire_active(self) -> bool:
+        """Whether a committed obstacle escape is waiting for target-lane feedback."""
+        return (
+            self.state == "changing_to_lane1"
+            and self._request_profile == "avoidance"
+        ) or (
+            self.state == "changing_to_lane2"
+            and self._return_profile == "avoidance"
+        )
+
+    @property
+    def avoidance_target_lane(self) -> Optional[int]:
+        """Physical lane whose corridor should replace the translated path."""
+        if (
+            self._request_profile == "avoidance"
+            and self.state in (
+                "changing_to_lane1",
+                "stabilizing_lane1",
+                "lane1",
+            )
+        ):
+            return 1
+        if (
+            self._return_profile == "avoidance"
+            and self.state in (
+                "changing_to_lane2",
+                "stabilizing_lane2",
+            )
+        ):
+            return 2
+        return None
 
     def apply_fixed_offset(
         self,
@@ -269,7 +305,7 @@ class LaneChangeController:
             offset_ratio = 0.0
 
         offset_px = offset_ratio * self._effective_lane_width(lane_width_px)
-        shifted, applied_offset_px = self._lane_target(
+        shifted, applied_offset_px, lane_reliable = self._lane_target(
             lane,
             offset_px,
             bev_width_px,
@@ -674,16 +710,33 @@ class LaneChangeController:
         if not lane.found or direction == 0:
             self._target_capture_frames = 0
             return False
+        observed_target = self._lane_observes_target(
+            lane,
+            1 if direction < 0 else 2,
+        )
+        if (
+            self.config.require_observed_target_lane
+            and not observed_target
+        ):
+            self._target_capture_frames = 0
+            return False
         lateral_error = (
             lane.near_lateral_error_norm
             if lane.near_lateral_error_norm is not None
             else lane.lateral_error_norm
         )
-        remaining_error = lateral_error * direction
         # The high-priority shift ends from target-lane feedback. The normal
         # lane controller then owns both steering direction and magnitude.
         capture_error = max(0.0, float(self.config.target_capture_error))
-        if remaining_error <= capture_error:
+        if observed_target:
+            captured_now = (
+                abs(lateral_error) <= capture_error
+                and abs(lane.lateral_error_norm) <= capture_error
+            )
+        else:
+            remaining_error = lateral_error * direction
+            captured_now = remaining_error <= capture_error
+        if captured_now:
             self._target_capture_frames += 1
         else:
             self._target_capture_frames = 0
@@ -719,6 +772,7 @@ class LaneChangeController:
     def _clear_stability(self) -> None:
         self._stable_frames = 0
         self._target_capture_frames = 0
+        self._target_lane_observed = False
 
     def _lock_lane_width(self, lane_width_px: float, profile: str) -> None:
         if self._locked_lane_width_px is not None:
@@ -742,16 +796,56 @@ class LaneChangeController:
         lane_reliable: bool,
     ) -> tuple:
         if not lane.found:
-            return lane, 0.0
+            return lane, 0.0, False
+        target_lane = self.avoidance_target_lane
+        observed_target = self._lane_observes_target(lane, target_lane)
+        if observed_target and lane_reliable:
+            # The estimator is already returning the physical target corridor.
+            # Applying the fixed lane-width translation again would put the path
+            # one additional lane away.
+            self._target_lane_observed = True
+            self._last_reliable_shifted_lane = lane
+            return lane, 0.0, True
+        if (
+            self.config.require_observed_target_lane
+            and target_lane is not None
+            and self._target_lane_observed
+        ):
+            if lane_reliable:
+                # If the physical outer boundary disappears after capture, keep
+                # adapting to the visible source corridor through the normal lane
+                # translation. It remains explicitly unreliable and therefore
+                # cannot confirm arrival or stabilization.
+                shifted = self._shift_lane_if_needed(
+                    lane,
+                    offset_px,
+                    bev_width_px,
+                )
+                self._last_reliable_shifted_lane = shifted
+                applied = shifted.center_x - lane.center_x
+                return shifted, applied, False
+            if self._last_reliable_shifted_lane is None:
+                return lane, 0.0, False
+            held = self._held_unreliable_lane(lane)
+            return held, 0.0, False
         if lane_reliable:
             shifted = self._shift_lane_if_needed(lane, offset_px, bev_width_px)
             self._last_reliable_shifted_lane = shifted
             applied = shifted.center_x - lane.center_x
-            return shifted, applied
+            return shifted, applied, True
         if self._hold_unreliable_target_active() and self._last_reliable_shifted_lane is not None:
             held = self._held_unreliable_lane(lane)
-            return held, 0.0
-        return lane, 0.0
+            return held, 0.0, False
+        return lane, 0.0, False
+
+    @staticmethod
+    def _lane_observes_target(
+        lane: LaneGeometry,
+        target_lane: Optional[int],
+    ) -> bool:
+        if target_lane not in (1, 2):
+            return False
+        return "target_lane%d" % int(target_lane) in lane.reason.split(":")
 
     def _hold_unreliable_target_active(self) -> bool:
         return self.state in (
