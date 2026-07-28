@@ -15,12 +15,16 @@ from typing import Any, Optional, Tuple
 from ..control.serial_vehicle import (
     SerialVehicleClient,
     SerialVehicleConfig,
-    UltrasonicReadings,
-    parse_ultrasonic_line,
+)
+from ..control.motion_safety import (
+    MotionSafetyConfig,
+    MotionSafetyGate,
+    MotionSafetySnapshot,
 )
 from ..estimation.locked_slot import (
-    LockedSlotPose,
+    FrozenSlotLandmarkMap,
     LockedSlotGeometryEstimator,
+    LockedSlotPose,
     LockedSlotTracker,
     LockedSlotTrackerConfig,
 )
@@ -29,13 +33,21 @@ from ..estimation.parking_geometry import ParkingGeometry, ParkingGeometryEstima
 from ..estimation.parking_lidar import (
     LidarParkingObservation,
     LidarParkingSpaceEstimator,
+    RectangleRoi,
     infer_dynamic_slot_polygon,
 )
 from ..parking_config import ParkingAppConfig, load_parking_config
 from ..perception.bev import BevTransformer
 from ..perception.yolo_lane import YoloLaneConfig, YoloLaneSegmenter
 from ..planning.t_parking_planner import ParkingState, TParkingPlanner
+from ..planning.reverse_parking_path import ReversePath
 from ..sensors.lidar import LidarCsvReplay, RplidarScanner, find_lidar_port
+from .parking_analysis_session import (
+    ParkingAnalysisSession,
+    analysis_recording_enabled,
+    parking_telemetry_row,
+    timestamped_session_directory,
+)
 
 
 LOG = logging.getLogger("skku_autocar.parking")
@@ -43,12 +55,30 @@ ROOT = Path(__file__).resolve().parents[3]
 LOCKED_SLOT_STATES = frozenset(
     (
         ParkingState.VERIFY_SLOT_BOX,
-        ParkingState.PLAN_REVERSE_PATH,
+        ParkingState.SET_REVERSE_STEER,
         ParkingState.FOLLOW_ENTRY_CURVE,
+        ParkingState.RELEASE_ENTRY_STEER,
         ParkingState.FOLLOW_SLOT_CENTER,
         ParkingState.CORRECT_FORWARD,
         ParkingState.CORRECT_REVERSE,
+        ParkingState.PARK_CONFIRM,
+        ParkingState.REACQUIRE_SLOT,
         ParkingState.PARKED,
+    )
+)
+# Capture the candidate box while the ordered two-car pair is still visible,
+# then carry that same box through the remaining forward prealignment. Pose
+# loss is not safety-critical in these forward states; LOCKED_SLOT_STATES below
+# remains the stricter boundary used by the motion-safety lease.
+SLOT_POSE_TRACKING_STATES = LOCKED_SLOT_STATES | frozenset(
+    (
+        ParkingState.PROVISIONAL_PREALIGN,
+        ParkingState.PREALIGN_LEFT,
+        # Timed recovery still needs the locked box to move in vehicle
+        # coordinates. It is intentionally not added to LOCKED_SLOT_STATES:
+        # temporary pose loss here must not replace the recovery command with
+        # the old stop/reacquire oscillation.
+        ParkingState.FINISH_REVERSE_TIMED,
     )
 )
 
@@ -151,6 +181,41 @@ def make_locked_slot_tracker(config: ParkingAppConfig) -> LockedSlotTracker:
                 runtime.locked_slot_max_rotation_per_scan_deg
             ),
             max_hold_scans=runtime.locked_slot_max_hold_scans,
+            map_min_points=runtime.locked_slot_map_min_points,
+            map_min_points_per_landmark=(
+                runtime.locked_slot_map_min_points_per_landmark
+            ),
+            map_max_points=runtime.locked_slot_map_max_points,
+            map_capture_radius_mm=(
+                runtime.locked_slot_map_capture_radius_mm
+            ),
+            map_max_correspondence_mm=(
+                runtime.locked_slot_map_max_correspondence_mm
+            ),
+            map_min_depth_span_mm=(
+                runtime.locked_slot_map_min_depth_span_mm
+            ),
+            map_icp_fallback_max_scans=(
+                runtime.locked_slot_map_icp_fallback_max_scans
+            ),
+            direct_pair_correction_max_translation_mm=(
+                runtime.locked_slot_direct_pair_correction_max_translation_mm
+            ),
+            direct_pair_correction_max_rotation_deg=(
+                runtime.locked_slot_direct_pair_correction_max_rotation_deg
+            ),
+            direct_pair_correction_alpha=(
+                runtime.locked_slot_direct_pair_correction_alpha
+            ),
+            direct_pair_correction_rotation_alpha=(
+                runtime.locked_slot_direct_pair_correction_rotation_alpha
+            ),
+            direct_pair_slew_translation_per_scan_mm=(
+                runtime.locked_slot_direct_pair_slew_translation_per_scan_mm
+            ),
+            direct_pair_slew_rotation_per_scan_deg=(
+                runtime.locked_slot_direct_pair_slew_rotation_per_scan_deg
+            ),
         )
     )
 
@@ -167,6 +232,12 @@ def make_slot_geometry_projector(
         vehicle_length_mm=config.runtime.lidar_debug_vehicle_length_mm,
         rear_axle_to_rear_bumper_mm=(
             config.runtime.lidar_debug_rear_axle_to_rear_bumper_mm
+        ),
+        sensor_behind_vehicle_rear_mm=(
+            config.runtime.lidar_debug_sensor_behind_vehicle_rear_mm
+        ),
+        park_completion_clearance_mm=(
+            config.runtime.park_completion_clearance_mm
         ),
     )
 
@@ -228,9 +299,12 @@ def run_prepared(args: argparse.Namespace) -> int:
         args,
     )
     camera_enabled = config.runtime.camera_enabled
+    camera_capture_enabled = camera_enabled or args.record_camera
     source = str(args.source) if args.source is not None else str(config.rear_camera.index)
-    is_video = camera_enabled and not source.isdigit()
-    is_replay = is_video or (not camera_enabled and args.lidar_csv is not None)
+    is_video = camera_capture_enabled and not source.isdigit()
+    is_replay = is_video or (
+        not camera_capture_enabled and args.lidar_csv is not None
+    )
     if is_replay and args.serial:
         raise RuntimeError(
             "--serial is forbidden for recorded replay; use live LiDAR/camera input"
@@ -253,6 +327,14 @@ def run_prepared(args: argparse.Namespace) -> int:
     lidar_estimator = LidarParkingSpaceEstimator(config.lidar)
     locked_slot_geometry = make_locked_slot_geometry(config)
     planner = TParkingPlanner(config.planner, config.path)
+    motion_safety = MotionSafetyGate(
+        MotionSafetyConfig(
+            lease_duration_s=config.runtime.motion_lease_s,
+            pose_stale_after_s=(
+                config.runtime.locked_slot_pose_stale_after_s
+            ),
+        )
+    )
 
     lidar_replay = LidarCsvReplay(str(resolve_path(args.lidar_csv))) if args.lidar_csv else None
     lidar_scanner = None
@@ -284,7 +366,7 @@ def run_prepared(args: argparse.Namespace) -> int:
 
     cap = None
     try:
-        if camera_enabled:
+        if camera_capture_enabled:
             cap = open_capture(cv2, source, config)
     except Exception:
         if lidar_scanner is not None:
@@ -301,14 +383,15 @@ def run_prepared(args: argparse.Namespace) -> int:
             lidar_scanner.close()
         raise
     last_command_at = 0.0
-    last_ultrasonic: Optional[UltrasonicReadings] = None
-    last_ultrasonic_at = float("-inf")
     run_started_at = time.monotonic()
     last_frame_at = run_started_at
     fps = 0.0
     frame_index = args.start_frame
     last_state = planner.state
     locked_slot_pose = LockedSlotPose()
+    lidar_failure_reason: Optional[str] = None
+    last_plan = None
+    session_completed_cleanly = False
 
     if args.auto_start:
         if not is_replay:
@@ -318,6 +401,12 @@ def run_prepared(args: argparse.Namespace) -> int:
 
     if segmenter is not None:
         LOG.info("source=%s model=%s device=%s", source, model_path, segmenter.device)
+    elif camera_capture_enabled:
+        LOG.info(
+            "camera capture enabled for recording only; parking control "
+            "remains LiDAR-only: source=%s",
+            source,
+        )
     else:
         LOG.info("camera=disabled; LiDAR-only parking runtime")
     LOG.info("controls: SPACE=start/resume | R=stop/reset | Q/ESC=quit")
@@ -326,8 +415,26 @@ def run_prepared(args: argparse.Namespace) -> int:
 
     dashboard_recorder: Optional[DashboardVideoRecorder] = None
     dashboard_record_path: Optional[Path] = None
+    analysis_session: Optional[ParkingAnalysisSession] = None
+    if analysis_recording_enabled(args.record_session, is_replay):
+        session_directory = timestamped_session_directory(
+            args.session_record_dir
+        )
+        analysis_session = ParkingAnalysisSession(
+            session_directory,
+            config=config,
+            cli_args=vars(args),
+        )
+        LOG.info(
+            "analysis session recording enabled: %s",
+            analysis_session.directory,
+        )
     if dashboard_recording_enabled(args.record_dashboard, is_replay):
-        dashboard_record_path = timestamped_dashboard_path(args.parking_record_dir)
+        dashboard_record_path = (
+            analysis_session.dashboard_path
+            if analysis_session is not None
+            else timestamped_dashboard_path(args.parking_record_dir)
+        )
         dashboard_recorder = DashboardVideoRecorder(
             cv2,
             dashboard_record_path,
@@ -368,11 +475,6 @@ def run_prepared(args: argparse.Namespace) -> int:
                     2,
                     cv2.LINE_AA,
                 )
-            if vehicle is not None:
-                sample = newest_ultrasonic_sample(vehicle.read_lines())
-                if sample is not None:
-                    last_ultrasonic = sample
-                    last_ultrasonic_at = monotonic_now
             dt = max(1e-6, monotonic_now - last_frame_at)
             fps = 0.9 * fps + 0.1 / dt if fps else 1.0 / dt
             last_frame_at = monotonic_now
@@ -399,55 +501,93 @@ def run_prepared(args: argparse.Namespace) -> int:
             )
             lidar_points = lidar_estimator.vehicle_points(lidar_scan)
             # The two bordering cars determine an official-size 950 x 1500 mm
-            # bay. Fresh, consistent two-car observations re-anchor its pose;
-            # scan matching carries the same rectangle only through occlusion.
+            # bay. A frozen map carries it after lock; direct observations may
+            # make a gated correction or a slew-limited localization recovery.
             geometry = locked_slot_geometry.update(
                 lidar_observation,
                 lidar_points,
-                lock_requested=planner.state in LOCKED_SLOT_STATES,
+                lock_requested=planner.state in SLOT_POSE_TRACKING_STATES,
             )
             locked_slot_pose = locked_slot_geometry.pose
-            ultrasonic_fresh = (
-                last_ultrasonic is not None
-                and monotonic_now - last_ultrasonic_at
-                <= config.planner.ultrasonic_stale_after_s
-            )
-            left_ultrasonic_mm = (
-                last_ultrasonic.side_left_mm if ultrasonic_fresh else None
-            )
-            right_ultrasonic_mm = (
-                last_ultrasonic.side_right_mm if ultrasonic_fresh else None
-            )
-            front_left_ultrasonic_mm = (
-                last_ultrasonic.front_left_mm if ultrasonic_fresh else None
-            )
-            front_right_ultrasonic_mm = (
-                last_ultrasonic.front_right_mm if ultrasonic_fresh else None
-            )
             plan = planner.update(
                 geometry,
                 lidar_observation,
                 elapsed,
                 enabled=True,
-                left_ultrasonic_mm=left_ultrasonic_mm,
-                right_ultrasonic_mm=right_ultrasonic_mm,
-                front_left_ultrasonic_mm=front_left_ultrasonic_mm,
-                front_right_ultrasonic_mm=front_right_ultrasonic_mm,
             )
+            planned_command = plan.command
+            # A map may already exist during provisional forward alignment.
+            # Pose loss there must not suppress the planner's forward search;
+            # the final gate becomes mandatory only from VERIFY onward.
+            pose_required = (
+                plan.state in LOCKED_SLOT_STATES
+                and (
+                    locked_slot_pose.locked
+                    or planned_command.speed != 0
+                )
+            )
+            safe_command = motion_safety.apply(
+                planned_command,
+                now=elapsed,
+                lidar=lidar_observation,
+                pose=locked_slot_pose,
+                pose_required=pose_required,
+            )
+            safety_overrode_command = safe_command != planned_command
+            if safety_overrode_command:
+                plan = replace(
+                    plan,
+                    command=safe_command,
+                    reason=safe_command.reason,
+                )
+            last_plan = plan
+            motion_safety_snapshot = motion_safety.snapshot(
+                elapsed,
+                pose_required=pose_required,
+            )
+            if analysis_session is not None:
+                analysis_session.record_lidar(
+                    lidar_scan,
+                    elapsed_s=elapsed,
+                )
+                analysis_session.record_telemetry(
+                    parking_telemetry_row(
+                        elapsed_s=elapsed,
+                        lidar=lidar_observation,
+                        geometry=geometry,
+                        pose=locked_slot_pose,
+                        landmark_map=locked_slot_geometry.landmark_map,
+                        plan=plan,
+                        planned_command=planned_command,
+                        safety=motion_safety_snapshot,
+                        safety_overrode_command=safety_overrode_command,
+                        pose_required=pose_required,
+                        icp_fallback_scans=(
+                            locked_slot_geometry.icp_fallback_scans
+                        ),
+                    )
+                )
             if planner.state != last_state:
                 LOG.info("parking state: %s -> %s (%s)", last_state.value, planner.state.value, plan.reason)
                 last_state = planner.state
 
             if (
                 vehicle is not None
-                and monotonic_now - last_command_at
-                >= 1.0 / max(1.0, config.runtime.command_rate_hz)
+                and (
+                    safety_overrode_command
+                    or monotonic_now - last_command_at
+                    >= 1.0 / max(1.0, config.runtime.command_rate_hz)
+                )
             ):
-                sample = newest_ultrasonic_sample(vehicle.send(plan.command))
-                if sample is not None:
-                    last_ultrasonic = sample
-                    last_ultrasonic_at = monotonic_now
+                vehicle.send(plan.command)
                 last_command_at = monotonic_now
+            if (
+                plan.state == ParkingState.EMERGENCY_STOP
+                and plan.reason.startswith("lidar_unavailable:")
+            ):
+                lidar_failure_reason = plan.reason
+                LOG.error("LiDAR connection lost; parking runtime is stopping: %s", plan.reason)
+                break
 
             display, bev_display = draw_debug(
                 cv2,
@@ -460,10 +600,6 @@ def run_prepared(args: argparse.Namespace) -> int:
                 lidar_observation,
                 plan,
                 fps,
-                left_ultrasonic_mm,
-                right_ultrasonic_mm,
-                front_left_ultrasonic_mm,
-                front_right_ultrasonic_mm,
                 show_status=False,
                 mask_geometry=camera_geometry,
             )
@@ -477,6 +613,8 @@ def run_prepared(args: argparse.Namespace) -> int:
                 plan,
                 slot_polygon=locked_slot_pose.polygon,
                 slot_status=locked_slot_pose.reason,
+                slot_landmark_map=locked_slot_geometry.landmark_map,
+                slot_pose=locked_slot_pose,
             )
             dashboard = draw_live_dashboard(
                 cv2,
@@ -489,13 +627,17 @@ def run_prepared(args: argparse.Namespace) -> int:
                 plan,
                 elapsed,
                 fps,
-                left_ultrasonic_mm,
-                right_ultrasonic_mm,
                 vehicle is not None,
                 dashboard_record_path,
                 camera_enabled=camera_enabled,
-                front_left_ultrasonic_mm=front_left_ultrasonic_mm,
-                front_right_ultrasonic_mm=front_right_ultrasonic_mm,
+                camera_record_only=(
+                    camera_capture_enabled and not camera_enabled
+                ),
+                slot_landmark_map=locked_slot_geometry.landmark_map,
+                slot_pose=locked_slot_pose,
+                path=plan.path,
+                motion_safety=motion_safety_snapshot,
+                icp_fallback_scans=locked_slot_geometry.icp_fallback_scans,
             )
             cv2.imshow("T Parking - Live Dashboard", dashboard)
             if dashboard_recorder is not None:
@@ -538,6 +680,7 @@ def run_prepared(args: argparse.Namespace) -> int:
                     geometry_estimator.reset()
                     lidar_estimator.reset()
                     locked_slot_geometry.reset()
+                    motion_safety.reset()
                     locked_slot_pose = LockedSlotPose()
                     LOG.info("parking mission started")
                 else:
@@ -547,6 +690,7 @@ def run_prepared(args: argparse.Namespace) -> int:
                 geometry_estimator.reset()
                 lidar_estimator.reset()
                 locked_slot_geometry.reset()
+                motion_safety.reset()
                 locked_slot_pose = LockedSlotPose()
                 if vehicle is not None:
                     vehicle.stop("operator_reset")
@@ -558,15 +702,13 @@ def run_prepared(args: argparse.Namespace) -> int:
                         break
                     skipped += 1
             frame_index += 1 + skipped
+        session_completed_cleanly = lidar_failure_reason is None
     finally:
         if vehicle is not None:
             try:
                 vehicle.stop("parking_shutdown")
             finally:
-                try:
-                    vehicle.write_line("USOFF")
-                finally:
-                    vehicle.close()
+                vehicle.close()
         if dashboard_recorder is not None:
             dashboard_recorder.close()
             if dashboard_recorder.frames_written > 0:
@@ -575,11 +717,41 @@ def run_prepared(args: argparse.Namespace) -> int:
                     dashboard_recorder.path,
                     dashboard_recorder.frames_written,
                 )
+        if analysis_session is not None:
+            final_reason = (
+                lidar_failure_reason
+                or (last_plan.reason if last_plan is not None else "runtime_shutdown")
+            )
+            try:
+                bundle_path = analysis_session.close(
+                    final_state=planner.state.value,
+                    final_reason=final_reason,
+                    completed_cleanly=session_completed_cleanly,
+                    dashboard_path=dashboard_record_path,
+                )
+                LOG.info(
+                    "analysis session saved: %s",
+                    analysis_session.directory,
+                )
+                if bundle_path is not None:
+                    LOG.info("replay bundle saved: %s", bundle_path)
+                else:
+                    LOG.warning(
+                        "replay bundle was not created because dashboard "
+                        "video or LiDAR scans were unavailable"
+                    )
+            except Exception:
+                LOG.exception(
+                    "analysis session finalization failed: %s",
+                    analysis_session.directory,
+                )
         if lidar_scanner is not None:
             lidar_scanner.close()
         if cap is not None:
             cap.release()
         cv2.destroyAllWindows()
+    if lidar_failure_reason is not None:
+        raise RuntimeError(lidar_failure_reason)
     return 0
 
 
@@ -690,12 +862,21 @@ def compose_parking_dashboard(
     )
     for index, text in enumerate(status_lines[:8]):
         color = (0, 255, 255) if index == 0 else (220, 220, 220)
+        font_scale = 0.55
+        text_width = cv2.getTextSize(
+            text,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            1,
+        )[0][0]
+        if text_width > 860:
+            font_scale = max(0.36, font_scale * 860.0 / text_width)
         cv2.putText(
             dashboard,
             text,
             (18, 510 + index * 26),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            font_scale,
             color,
             1,
             cv2.LINE_AA,
@@ -714,13 +895,15 @@ def draw_live_dashboard(
     plan: Any,
     elapsed_s: float,
     fps: float,
-    left_ultrasonic_mm: Optional[float],
-    right_ultrasonic_mm: Optional[float],
     motor_output_enabled: bool,
     recording_path: Optional[Path],
     camera_enabled: bool = True,
-    front_left_ultrasonic_mm: Optional[float] = None,
-    front_right_ultrasonic_mm: Optional[float] = None,
+    camera_record_only: bool = False,
+    slot_landmark_map: Optional[FrozenSlotLandmarkMap] = None,
+    slot_pose: LockedSlotPose = LockedSlotPose(),
+    path: Optional[ReversePath] = None,
+    motion_safety: Optional[MotionSafetySnapshot] = None,
+    icp_fallback_scans: int = 0,
 ) -> Any:
     state_color = parking_state_color(plan.state)
     wall_time = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
@@ -731,14 +914,20 @@ def draw_live_dashboard(
         else lidar.gap_center_y_back_mm / 10.0
     )
     width_cm = None if lidar.gap_width_mm is None else lidar.gap_width_mm / 10.0
-    depth = (
-        "-"
-        if geometry.depth_remaining_px is None
-        else "%.1fpx" % geometry.depth_remaining_px
+    if camera_record_only:
+        camera_status = "CAMERA REC / LIDAR CONTROL"
+    elif camera_enabled:
+        camera_status = "LIVE CAMERA"
+    else:
+        camera_status = "LIDAR ONLY"
+    second_gate_status = (
+        "ARMED"
+        if lidar.second_car_gate_armed
+        else ("PASSED" if lidar.first_car_gate_passed else "WAIT")
     )
     status_lines = (
         "%s | MOTOR=%s | REC=%s" % (
-            "LIVE CAMERA" if camera_enabled else "LIDAR ONLY",
+            camera_status,
             "ENABLED" if motor_output_enabled else "DISABLED",
             recording_name,
         ),
@@ -748,8 +937,12 @@ def draw_live_dashboard(
             plan.command.steering,
             plan.reason,
         ),
-        "LiDAR %s pts=%d/%d cars=%d gap=%s centerY=%s cm width=%s cm" % (
+        "LiDAR %s scan=%.3f new=%s roi=%s gate=%s pts=%d/%d cars=%d gap=%s centerY=%s width=%s cm" % (
             lidar.reason,
+            lidar.timestamp if lidar.timestamp is not None else -1.0,
+            "Y" if lidar.is_new_scan else "N",
+            "EXPANDED" if lidar.tracking_roi_expanded else "INITIAL",
+            second_gate_status,
             lidar.observed_points,
             lidar.car_roi_points,
             lidar.car_count,
@@ -759,51 +952,19 @@ def draw_live_dashboard(
             format_dashboard_value(center_cm, signed=True),
             format_dashboard_value(width_cm),
         ),
-        "FIRST CAR edgeY=%s cm targetErr=%s cm turn=%s" % (
-            format_dashboard_value(
-                None
-                if lidar.first_car_slot_edge_y_back_mm is None
-                else lidar.first_car_slot_edge_y_back_mm / 10.0,
-                signed=True,
-            ),
-            format_dashboard_value(
-                None
-                if lidar.first_car_turn_error_mm is None
-                else lidar.first_car_turn_error_mm / 10.0,
-                signed=True,
-            ),
-            "READY" if lidar.first_car_turn_reached else "waiting",
+        "POSE %s" % format_locked_slot_pose_status(slot_pose),
+        "MAP %s | icp=%d" % (
+            format_slot_landmark_map_status(slot_landmark_map),
+            icp_fallback_scans,
         ),
-        "LOCKED SLOT inside=%.0f%% full=%s conf=%.2f lat=%+.2f head=%+.1f depth=%s (%s)" % (
-            geometry.vehicle_inside_ratio * 100.0,
-            "Y" if geometry.vehicle_fully_inside else "N",
-            geometry.confidence,
-            geometry.lateral_error_norm,
-            geometry.heading_error_deg,
-            depth,
-            geometry.reason,
+        "PATH %s" % format_reverse_path_status(path),
+        "LEASE %s" % format_motion_safety_status(motion_safety),
+        "FOOTPRINT %s | FPS=%.1f t=%.2fs %s" % (
+            format_slot_footprint_status(geometry),
+            fps,
+            elapsed_s,
+            wall_time,
         ),
-        "ULTRASONIC FL=%s FR=%s | SL=%s SR=%s cm | BODY_MID_INSIDE=%s" % (
-            format_dashboard_value(
-                None
-                if front_left_ultrasonic_mm is None
-                else front_left_ultrasonic_mm / 10.0
-            ),
-            format_dashboard_value(
-                None
-                if front_right_ultrasonic_mm is None
-                else front_right_ultrasonic_mm / 10.0
-            ),
-            format_dashboard_value(
-                None if left_ultrasonic_mm is None else left_ultrasonic_mm / 10.0
-            ),
-            format_dashboard_value(
-                None if right_ultrasonic_mm is None else right_ultrasonic_mm / 10.0
-            ),
-            "Y" if getattr(plan, "body_mid_inside", False) else "N",
-        ),
-        "FPS=%.1f | elapsed=%.2fs | %s" % (fps, elapsed_s, wall_time),
-        "Colors: CYAN=left GREEN=right RED=back MAGENTA=unclassified | SPACE start/resume R stop/reset Q quit",
     )
     return compose_parking_dashboard(
         cv2,
@@ -828,14 +989,126 @@ def format_dashboard_value(value: Optional[float], signed: bool = False) -> str:
     return ("%+.1f" if signed else "%.1f") % value
 
 
+def format_slot_landmark_map_status(
+    landmark_map: Optional[FrozenSlotLandmarkMap],
+) -> str:
+    if landmark_map is None:
+        return "UNFROZEN"
+    return "FROZEN scan=%.3f size=%.0fx%.0fmm landmarks=%d surfaces=%d (%s)" % (
+        landmark_map.source_scan_timestamp,
+        landmark_map.slot_width_mm,
+        landmark_map.slot_depth_mm,
+        len(landmark_map.landmarks),
+        len(landmark_map.surface_points_local),
+        landmark_map.reason,
+    )
+
+
+def format_locked_slot_pose_status(pose: LockedSlotPose) -> str:
+    scan_timestamp = (
+        "-" if pose.scan_timestamp is None else "%.3f" % pose.scan_timestamp
+    )
+    return (
+        (
+            "%s L/T/S/H/X=%d/%d/%d/%d/%d scan=%s move=%.1fmm "
+            "rot=%+.2fdeg support=%d pair=%s span=%.0fmm (%s)"
+        )
+        % (
+            pose.source.value,
+            int(pose.locked),
+            int(pose.tracked),
+            int(pose.stale),
+            int(pose.held),
+            int(pose.lost),
+            scan_timestamp,
+            pose.translation_mm,
+            pose.rotation_deg,
+            pose.support_points,
+            "Y" if pose.bilateral_support else "N",
+            pose.depth_span_mm,
+            pose.reason,
+        )
+    )
+
+
+def format_reverse_path_status(path: Optional[ReversePath]) -> str:
+    if path is None:
+        return "NONE"
+    lookahead = (
+        "-"
+        if path.lookahead_point is None
+        else "(%.1f,%.1f)" % path.lookahead_point
+    )
+    clearance = (
+        "-"
+        if path.minimum_side_clearance_px is None
+        else "%.1f" % path.minimum_side_clearance_px
+    )
+    return (
+        "%s found=%s pts=%d curv=%.5f/%.5f steer=%.2f "
+        "side_clear=%s look=%s (%s)"
+    ) % (
+        path.status.value,
+        "Y" if path.found else "N",
+        len(path.points),
+        path.curvature_per_px,
+        path.maximum_curvature_per_px,
+        path.entry_steering_ratio,
+        clearance,
+        lookahead,
+        path.reason,
+    )
+
+
+def format_motion_safety_status(
+    snapshot: Optional[MotionSafetySnapshot],
+) -> str:
+    if snapshot is None:
+        return "UNAVAILABLE"
+
+    def seconds(value: Optional[float]) -> str:
+        return "-" if value is None else "%.3f" % value
+
+    return "required=%s valid=%s remain=%ss age=%ss expires=%s fresh=%s" % (
+        "Y" if snapshot.pose_required else "N",
+        "Y" if snapshot.lease_valid else "N",
+        seconds(snapshot.lease_remaining_s),
+        seconds(snapshot.pose_age_s),
+        seconds(snapshot.lease_expires_at),
+        seconds(snapshot.last_fresh_pose_at),
+    )
+
+
+def format_slot_footprint_status(geometry: ParkingGeometry) -> str:
+    def centimeters(value: Optional[float]) -> str:
+        return format_dashboard_value(
+            None if value is None else value / 10.0,
+            signed=True,
+        )
+
+    return "candidate=%s lat=[%s,%s]cm depth=[%s,%s]cm (%s)" % (
+        "Y" if geometry.park_completion_candidate else "N",
+        centimeters(geometry.vehicle_footprint_min_lateral_mm),
+        centimeters(geometry.vehicle_footprint_max_lateral_mm),
+        centimeters(geometry.vehicle_footprint_min_depth_mm),
+        centimeters(geometry.vehicle_footprint_max_depth_mm),
+        geometry.park_completion_reason,
+    )
+
+
 def parking_state_color(state: ParkingState) -> Tuple[int, int, int]:
     if state in (ParkingState.EMERGENCY_STOP, ParkingState.ABORTED):
         return (0, 0, 255)
     if state in (ParkingState.PARKED, ParkingState.EXIT_DONE):
         return (255, 255, 255)
     if state in (
+        ParkingState.SET_REVERSE_STEER,
         ParkingState.FOLLOW_ENTRY_CURVE,
+        ParkingState.RELEASE_ENTRY_STEER,
         ParkingState.FOLLOW_SLOT_CENTER,
+        ParkingState.PARK_CONFIRM,
+        ParkingState.REACQUIRE_SLOT,
+        ParkingState.FINISH_REVERSE_TIMED,
         ParkingState.EXIT_RIGHT,
         ParkingState.EXIT_STRAIGHT,
     ):
@@ -845,7 +1118,6 @@ def parking_state_color(state: ParkingState) -> Tuple[int, int, int]:
         ParkingState.POSITION_REAR_AXLE,
         ParkingState.PREALIGN_LEFT,
         ParkingState.VERIFY_SLOT_BOX,
-        ParkingState.PLAN_REVERSE_PATH,
     ):
         return (0, 165, 255)
     if state == ParkingState.SEARCH_CARS:
@@ -864,10 +1136,6 @@ def draw_debug(
     lidar: LidarParkingObservation,
     plan: Any,
     fps: float,
-    left_ultrasonic_mm: Optional[float] = None,
-    right_ultrasonic_mm: Optional[float] = None,
-    front_left_ultrasonic_mm: Optional[float] = None,
-    front_right_ultrasonic_mm: Optional[float] = None,
     show_status: bool = True,
     mask_geometry: Optional[ParkingGeometry] = None,
 ) -> Tuple[Any, Any]:
@@ -934,12 +1202,7 @@ def draw_debug(
             "Y" if lidar.first_car_turn_reached else "N",
         ),
         "plan=%s" % plan.reason,
-        "ultrasonic FL=%s FR=%s SL=%s SR=%s" % (
-            "-" if front_left_ultrasonic_mm is None else "%.0fmm" % front_left_ultrasonic_mm,
-            "-" if front_right_ultrasonic_mm is None else "%.0fmm" % front_right_ultrasonic_mm,
-            "-" if left_ultrasonic_mm is None else "%.0fmm" % left_ultrasonic_mm,
-            "-" if right_ultrasonic_mm is None else "%.0fmm" % right_ultrasonic_mm,
-        ),
+        "sensors=LiDAR-only | LiDAR loss stops and terminates runtime",
         "fps=%.1f | SPACE start/resume | R stop/reset | Q quit" % fps,
     )
     if show_status:
@@ -1000,6 +1263,8 @@ def draw_lidar_debug(
     plan: Any,
     slot_polygon: Optional[tuple] = None,
     slot_status: str = "",
+    slot_landmark_map: Optional[FrozenSlotLandmarkMap] = None,
+    slot_pose: Optional[LockedSlotPose] = None,
 ) -> Any:
     size = 600
     scale = 0.10  # 6 m across the full canvas.
@@ -1018,10 +1283,36 @@ def draw_lidar_debug(
         cv2, canvas, config.lidar.car_detection_roi,
         origin, scale, rotation_deg, (120, 80, 0),
     )
-    if observation.gap_confirmed and config.lidar.slot_tracking_roi is not None:
+    if (
+        (observation.tracking_roi_expanded or observation.gap_confirmed)
+        and config.lidar.slot_tracking_roi is not None
+    ):
         draw_roi(
             cv2, canvas, config.lidar.slot_tracking_roi,
             origin, scale, rotation_deg, (120, 0, 120),
+        )
+    if observation.tracking_roi_expanded:
+        rear_axle_y = config.lidar.sensor_to_rear_axle_y_back_mm
+        second_car_gate = RectangleRoi(
+            config.lidar.second_car_gate_x_min_right_mm,
+            config.lidar.second_car_gate_x_max_right_mm,
+            (
+                rear_axle_y
+                + config.lidar.second_car_gate_y_from_rear_axle_min_mm
+            ),
+            (
+                rear_axle_y
+                + config.lidar.second_car_gate_y_from_rear_axle_max_mm
+            ),
+        )
+        draw_roi(
+            cv2,
+            canvas,
+            second_car_gate,
+            origin,
+            scale,
+            rotation_deg,
+            (0, 180, 180),
         )
     draw_roi(
         cv2, canvas, config.lidar.safety_roi,
@@ -1140,6 +1431,32 @@ def draw_lidar_debug(
             (0, 255, 0),
             -1,
         )
+    landmark_points = (
+        slot_landmark_map.points_in_vehicle_frame(slot_pose)
+        if slot_landmark_map is not None and slot_pose is not None
+        else ()
+    )
+    for index, (_landmark_id, point) in enumerate(landmark_points):
+        color = (255, 80, 255) if index == 0 else (80, 255, 255)
+        pixel = world_to_lidar_pixel(
+            point[0],
+            point[1],
+            origin,
+            scale,
+            rotation_deg,
+        )
+        cv2.circle(canvas, pixel, 8, color, 2, cv2.LINE_AA)
+        cv2.circle(canvas, pixel, 3, color, -1)
+        cv2.putText(
+            canvas,
+            "LM%d" % (index + 1),
+            (pixel[0] + 7, pixel[1] - 7),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
     draw_reverse_path_on_lidar(
         cv2,
         np,
@@ -1218,7 +1535,7 @@ def draw_lidar_debug(
     )
     cv2.putText(
         canvas,
-        "orange=locked 95x150cm slot | cyan=local target/path | blue=cars",
+        "orange=slot | cyan=path | blue=cars | LM1/LM2=frozen landmarks",
         (12, size - 15),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.52,
@@ -1249,6 +1566,18 @@ def draw_lidar_debug(
             config.lidar.sensor_to_rear_axle_y_back_mm / 10.0,
         ),
         (12, size - 61),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (220, 220, 220),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        "landmark_map=%s | display_only" % (
+            format_slot_landmark_map_status(slot_landmark_map)
+        ),
+        (12, size - 84),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.48,
         (220, 220, 220),
@@ -1630,6 +1959,7 @@ def open_vehicle(args: argparse.Namespace, config: ParkingAppConfig) -> SerialVe
             abs(config.planner.gap_tracking_speed),
             abs(config.planner.position_speed),
             abs(config.planner.prealign_speed),
+            abs(config.planner.provisional_prealign_speed),
             abs(config.planner.reverse_entry_speed),
             abs(config.planner.reverse_center_speed),
             abs(config.planner.correction_forward_speed),
@@ -1644,18 +1974,8 @@ def open_vehicle(args: argparse.Namespace, config: ParkingAppConfig) -> SerialVe
         ),
     )
     client.connect()
-    client.write_line("USON")
     LOG.info("serial connected: %s", client.port)
     return client
-
-
-def newest_ultrasonic_sample(lines: list[str]) -> Optional[UltrasonicReadings]:
-    newest = None
-    for line in lines:
-        parsed = parse_ultrasonic_line(line)
-        if parsed is not None:
-            newest = parsed
-    return newest
 
 
 def open_capture(cv2: Any, source: str, config: ParkingAppConfig) -> Any:
@@ -1751,7 +2071,11 @@ def apply_cli_overrides(config: ParkingAppConfig, args: argparse.Namespace) -> P
             ),
         )
     if args.prealign_speed is not None:
-        planner = replace(planner, prealign_speed=args.prealign_speed)
+        planner = replace(
+            planner,
+            provisional_prealign_speed=args.prealign_speed,
+            prealign_speed=args.prealign_speed,
+        )
     if args.prealign_steering is not None:
         planner = replace(planner, prealign_steering=args.prealign_steering)
     if args.prealign_timeout_s is not None:
@@ -1766,11 +2090,6 @@ def apply_cli_overrides(config: ParkingAppConfig, args: argparse.Namespace) -> P
         planner = replace(planner, exit_turn_s=args.exit_turn_s)
     if args.exit_straight_s is not None:
         planner = replace(planner, exit_straight_s=args.exit_straight_s)
-    if args.exit_right_min_clearance_cm is not None:
-        planner = replace(
-            planner,
-            exit_right_min_clearance_mm=args.exit_right_min_clearance_cm * 10.0,
-        )
     if bev.src_top_left[0] >= bev.src_top_right[0]:
         raise ValueError("BEV top-left x must be smaller than top-right x")
     if bev.src_bottom_left[0] >= bev.src_bottom_right[0]:
@@ -1840,6 +2159,14 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         help="run LiDAR-only without opening a camera or loading YOLO",
     )
     parser.set_defaults(camera_enabled=None)
+    parser.add_argument(
+        "--record-camera",
+        action="store_true",
+        help=(
+            "open the rear camera for the dashboard recording only; "
+            "YOLO stays disabled and parking control remains LiDAR-only"
+        ),
+    )
     parser.add_argument("--recording-zip", default=None, help="ZIP containing one MP4 and one *_lidar.csv")
     parser.add_argument("--model", default=None, help="parking YOLO segmentation model")
     parser.add_argument("--device", default=None, help="auto, cpu, mps, 0, cuda, ...")
@@ -1871,6 +2198,20 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         type=float,
         default=10.0,
         help="dashboard MP4 frame rate",
+    )
+    parser.add_argument(
+        "--record-session",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "save live dashboard, raw LiDAR, planner telemetry, metadata, "
+            "and a replay ZIP; auto records live runs"
+        ),
+    )
+    parser.add_argument(
+        "--session-record-dir",
+        default="data/parking_sessions",
+        help="root directory for timestamped parking analysis sessions",
     )
     parser.add_argument("--bev-top-y", type=float, default=None, help="BEV source top y ratio")
     parser.add_argument("--bev-top-left-x", type=float, default=None, help="BEV source top-left x ratio")
@@ -1965,12 +2306,6 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         default=None,
         help="seconds to drive straight after the exit turn; 0 keeps driving until cancelled",
     )
-    parser.add_argument(
-        "--exit-right-min-clearance-cm",
-        type=float,
-        default=None,
-        help="stop exit turn while right ultrasonic distance is at or below this value",
-    )
     args = parser.parse_args(argv)
     if args.frame_stride < 1:
         parser.error("--frame-stride must be at least 1")
@@ -2026,11 +2361,6 @@ def parse_args(argv: Optional[list]) -> argparse.Namespace:
         parser.error("--exit-turn-s cannot be negative")
     if args.exit_straight_s is not None and args.exit_straight_s < 0.0:
         parser.error("--exit-straight-s cannot be negative")
-    if (
-        args.exit_right_min_clearance_cm is not None
-        and args.exit_right_min_clearance_cm < 0.0
-    ):
-        parser.error("--exit-right-min-clearance-cm cannot be negative")
     if (
         args.first_car_turn_target_cm is not None
         and not -250.0 <= args.first_car_turn_target_cm <= 250.0

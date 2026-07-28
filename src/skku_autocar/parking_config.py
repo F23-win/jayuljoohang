@@ -26,6 +26,8 @@ class ParkingYoloConfig:
 class ParkingRuntimeConfig:
     camera_enabled: bool = False
     command_rate_hz: float = 20.0
+    motion_lease_s: float = 0.30
+    locked_slot_pose_stale_after_s: float = 0.35
     lidar_video_offset_s: float = 0.0
     require_lidar: bool = True
     debug_window: bool = True
@@ -37,8 +39,9 @@ class ParkingRuntimeConfig:
     # Positive distance means the LiDAR origin is behind the rear bumper.
     lidar_debug_sensor_behind_vehicle_rear_mm: float = 100.0
     lidar_debug_rear_axle_to_rear_bumper_mm: float = 200.0
+    park_completion_clearance_mm: float = 20.0
     locked_slot_tracking_enabled: bool = True
-    locked_slot_min_points: int = 8
+    locked_slot_min_points: int = 6
     locked_slot_max_points: int = 180
     locked_slot_min_range_mm: float = 200.0
     locked_slot_max_range_mm: float = 3500.0
@@ -48,6 +51,19 @@ class ParkingRuntimeConfig:
     locked_slot_max_translation_per_scan_mm: float = 300.0
     locked_slot_max_rotation_per_scan_deg: float = 15.0
     locked_slot_max_hold_scans: int = 3
+    locked_slot_map_min_points: int = 6
+    locked_slot_map_min_points_per_landmark: int = 2
+    locked_slot_map_max_points: int = 240
+    locked_slot_map_capture_radius_mm: float = 1200.0
+    locked_slot_map_max_correspondence_mm: float = 260.0
+    locked_slot_map_min_depth_span_mm: float = 120.0
+    locked_slot_map_icp_fallback_max_scans: int = 2
+    locked_slot_direct_pair_correction_max_translation_mm: float = 80.0
+    locked_slot_direct_pair_correction_max_rotation_deg: float = 5.0
+    locked_slot_direct_pair_correction_alpha: float = 0.25
+    locked_slot_direct_pair_correction_rotation_alpha: float = 0.55
+    locked_slot_direct_pair_slew_translation_per_scan_mm: float = 50.0
+    locked_slot_direct_pair_slew_rotation_per_scan_deg: float = 3.0
 
 
 @dataclass(frozen=True)

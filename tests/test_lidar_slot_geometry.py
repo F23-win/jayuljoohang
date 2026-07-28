@@ -82,6 +82,14 @@ class LidarSlotGeometryProjectorTest(unittest.TestCase):
         self.assertEqual(geometry.reason, "lidar_slot_box")
         self.assertEqual(geometry.observed_line_count, 0)
         self.assertAlmostEqual(geometry.slot_width_px, 220.0, delta=0.1)
+        self.assertGreater(geometry.slot_depth_px, geometry.slot_width_px)
+        self.assertAlmostEqual(geometry.vehicle_width_px, 138.9, delta=0.1)
+        self.assertAlmostEqual(geometry.vehicle_length_px, 231.6, delta=0.1)
+        self.assertAlmostEqual(
+            geometry.rear_axle_to_rear_bumper_px,
+            46.3,
+            delta=0.1,
+        )
         self.assertAlmostEqual(geometry.heading_error_deg, 0.0, delta=0.1)
         self.assertAlmostEqual(geometry.lateral_error_norm, 0.0, delta=0.1)
         self.assertGreater(geometry.depth_remaining_px, 45.0)
@@ -136,8 +144,61 @@ class LidarSlotGeometryProjectorTest(unittest.TestCase):
 
         self.assertTrue(inside.vehicle_fully_inside)
         self.assertAlmostEqual(inside.vehicle_inside_ratio, 1.0)
+        self.assertTrue(inside.park_completion_candidate)
+        self.assertEqual(
+            inside.park_completion_reason,
+            "footprint_inside_fixed_slot",
+        )
+        self.assertAlmostEqual(
+            inside.vehicle_footprint_min_lateral_mm,
+            -300.0,
+        )
+        self.assertAlmostEqual(
+            inside.vehicle_footprint_max_lateral_mm,
+            300.0,
+        )
+        self.assertAlmostEqual(
+            inside.vehicle_footprint_min_depth_mm,
+            100.0,
+        )
+        self.assertAlmostEqual(
+            inside.vehicle_footprint_max_depth_mm,
+            1100.0,
+        )
         self.assertFalse(outside.vehicle_fully_inside)
         self.assertAlmostEqual(outside.vehicle_inside_ratio, 0.0)
+        self.assertFalse(outside.park_completion_candidate)
+
+    def test_completion_uses_measured_lidar_to_rear_offset(self):
+        farther_rear_lidar = LidarSlotGeometryProjector(
+            self.lidar_config,
+            self.geometry_config,
+            canvas_width=600,
+            canvas_height=600,
+            vehicle_width_mm=600.0,
+            vehicle_length_mm=1000.0,
+            sensor_behind_vehicle_rear_mm=200.0,
+            park_completion_clearance_mm=20.0,
+        )
+        slot = (
+            (-475.0, -1200.0),
+            (475.0, -1200.0),
+            (475.0, 300.0),
+            (-475.0, 300.0),
+        )
+
+        geometry = farther_rear_lidar.project_polygon(slot)
+
+        self.assertTrue(geometry.vehicle_fully_inside)
+        self.assertFalse(geometry.park_completion_candidate)
+        self.assertAlmostEqual(
+            geometry.vehicle_footprint_min_depth_mm,
+            0.0,
+        )
+        self.assertEqual(
+            geometry.park_completion_reason,
+            "footprint_crosses_slot_entrance",
+        )
 
 
 if __name__ == "__main__":

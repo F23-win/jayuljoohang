@@ -1,0 +1,122 @@
+{
+  "lidar_scans": 419,
+  "duration_s": 46.797,
+  "gap_confirmed_scans": 200,
+  "gap_hold_scans": 13,
+  "slot_depth_flip_count": 0,
+  "minimum_consecutive_slot_depth_dot": 1.0,
+  "closest_gap_center_abs_cm": 42.923,
+  "minimum_rear_lidar_cm": 375.7,
+  "camera_samples": 0,
+  "camera_valid_samples": 0,
+  "camera_valid_ratio": null,
+  "camera_samples_with_line_mask": 0,
+  "camera_samples_with_two_masks": 0,
+  "camera_geometry_reason_counts": {},
+  "final_state": "ABORTED",
+  "final_planner_state": "aborted",
+  "transitions": [
+    {
+      "elapsed_s": 12.093,
+      "from": "SEARCHING",
+      "to": "POSITIONING",
+      "event": "first_car_turn_reached:provisional_settle_max_left"
+    },
+    {
+      "elapsed_s": 28.774,
+      "from": "POSITIONING",
+      "to": "REVERSING",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 45.343,
+      "from": "REVERSING",
+      "to": "ABORTED",
+      "event": "entry_curve_timeout"
+    }
+  ],
+  "planner_transitions": [
+    {
+      "elapsed_s": 12.093,
+      "from": "search_cars",
+      "to": "provisional_prealign",
+      "event": "first_car_turn_reached:provisional_settle_max_left"
+    },
+    {
+      "elapsed_s": 28.774,
+      "from": "provisional_prealign",
+      "to": "verify_slot_box",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 28.886,
+      "from": "verify_slot_box",
+      "to": "set_reverse_steer",
+      "event": "reverse_path_armed:curve:set_candidate_steer"
+    },
+    {
+      "elapsed_s": 29.332,
+      "from": "set_reverse_steer",
+      "to": "follow_entry_curve",
+      "event": "following_entry_curve:candidate_steer"
+    },
+    {
+      "elapsed_s": 45.343,
+      "from": "follow_entry_curve",
+      "to": "aborted",
+      "event": "entry_curve_timeout"
+    }
+  ],
+  "ultrasonic_replayed": false,
+  "pose_source_counts": {
+    "NONE": 232,
+    "DIRECT_PAIR": 1,
+    "DIRECT_PAIR_CORRECTION": 6,
+    "MAP_LOCALIZATION": 179,
+    "TRACKER_FALLBACK": 1
+  },
+  "pose_reason_counts": {
+    "slot_not_locked": 122,
+    "locked_slot_fallback_unavailable": 110,
+    "direct_pair": 1,
+    "direct_pair_gated_correction": 6,
+    "slot_map_localized": 179,
+    "short_icp_fallback": 1
+  },
+  "path_status_counts": {
+    "collision_risk": 26,
+    "ready": 157
+  },
+  "map_frozen_scans": 187,
+  "maximum_map_icp_fallback_scans": 1,
+  "lease_required_scans": 148,
+  "lease_valid_scans": 150,
+  "lease_stop_scans": 0,
+  "park_completion_candidate_scans": 0,
+  "pose_lost_scans": 0,
+  "pose_bilateral_support_scans": 181,
+  "map_localized_scans": 179,
+  "map_depth_unobservable_scans": 0,
+  "direct_pair_axis_flip_count": 0,
+  "side_boundary_collision_scans": 25,
+  "recording_zip": "C:\\Users\\권희승\\PycharmProjects\\smartcar\\jayuljoohang\\data\\parking_sessions\\20260728_140322\\20260728_140322_replay.zip",
+  "video": "20260728_140322_dashboard.mp4",
+  "lidar_csv": "20260728_140322_lidar.csv",
+  "output_csv": "C:\\Users\\권희승\\PycharmProjects\\smartcar\\jayuljoohang\\.codex_tmp\\20260728_140322_prelock_diagnostic.csv",
+  "camera_enabled": false,
+  "camera_interval_s": 0.5,
+  "position_tolerance_cm": 10.0,
+  "lidar_to_rear_axle_cm": -30.0,
+  "planner_implementation": "TParkingPlanner(shared_with_parking.py)",
+  "first_car_turn_target_cm": -65.0,
+  "prealign_speed": 100,
+  "prealign_steering": -120,
+  "prealign_timeout_s": 6.0,
+  "visual_replay": false,
+  "saved_video": null,
+  "limitations": [
+    "Camera and ultrasonic channels are diagnostics only; shared planner commands use LiDAR.",
+    "Virtual drive/steer commands cannot alter the prerecorded vehicle trajectory.",
+    "rear_lidar_cm is a diagnostic approximation and is not used by the shared planner."
+  ]
+}

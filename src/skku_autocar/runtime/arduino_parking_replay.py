@@ -12,7 +12,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from ..estimation.locked_slot import LockedSlotPose
+from ..control.motion_safety import MotionSafetyConfig, MotionSafetyGate
+from ..estimation.locked_slot import FrozenSlotLandmarkMap, LockedSlotPose
 from ..estimation.parking_geometry import ParkingGeometry, ParkingGeometryEstimator
 from ..estimation.parking_lidar import (
     LidarParkingObservation,
@@ -25,11 +26,17 @@ from ..planning.t_parking_planner import ParkingPlan, ParkingState, TParkingPlan
 from ..sensors.lidar import LidarScan, load_lidar_csv
 from .parking_app import (
     LOCKED_SLOT_STATES,
+    SLOT_POSE_TRACKING_STATES,
     compose_parking_dashboard,
     draw_lidar_debug,
     draw_parking_line,
     draw_reverse_path,
     extract_recording_zip,
+    format_locked_slot_pose_status,
+    format_motion_safety_status,
+    format_reverse_path_status,
+    format_slot_footprint_status,
+    format_slot_landmark_map_status,
     make_locked_slot_geometry,
     parking_mask_color,
 )
@@ -390,12 +397,17 @@ class SharedParkingPlannerReplay:
         self.planner.start(0.0)
         self.state = ReplayParkingState.SEARCHING
         self.positioning_phase = ReplayPositioningPhase.TRACK_FIRST_CAR
-        self.prealign_confirm_count = 0
         self.tracked_gap_center_y_back_cm = 0.0
-        self.gap_confirm_count = 0
-        self.position_confirm_count = 0
-        self.finish_confirm_count = 0
         self.last_plan: Optional[ParkingPlan] = None
+        self.last_pose_required = False
+        self.motion_safety = MotionSafetyGate(
+            MotionSafetyConfig(
+                lease_duration_s=config.runtime.motion_lease_s,
+                pose_stale_after_s=(
+                    config.runtime.locked_slot_pose_stale_after_s
+                ),
+            )
+        )
 
     @property
     def planner_state(self) -> ParkingState:
@@ -406,46 +418,47 @@ class SharedParkingPlannerReplay:
         lidar: LidarParkingObservation,
         geometry: ParkingGeometry,
         elapsed_s: float,
-        left_ultrasonic_cm: Optional[float] = None,
-        right_ultrasonic_cm: Optional[float] = None,
-        front_left_ultrasonic_cm: Optional[float] = None,
-        front_right_ultrasonic_cm: Optional[float] = None,
+        pose: LockedSlotPose = LockedSlotPose(),
+        *,
+        localization_required: bool = False,
     ) -> ReplayCommand:
         plan = self.planner.update(
             geometry,
             lidar,
             elapsed_s,
             enabled=True,
-            left_ultrasonic_mm=(
-                None
-                if left_ultrasonic_cm is None
-                else left_ultrasonic_cm * 10.0
-            ),
-            right_ultrasonic_mm=(
-                None
-                if right_ultrasonic_cm is None
-                else right_ultrasonic_cm * 10.0
-            ),
-            front_left_ultrasonic_mm=(
-                None
-                if front_left_ultrasonic_cm is None
-                else front_left_ultrasonic_cm * 10.0
-            ),
-            front_right_ultrasonic_mm=(
-                None
-                if front_right_ultrasonic_cm is None
-                else front_right_ultrasonic_cm * 10.0
-            ),
         )
+        self.last_pose_required = (
+            (
+                plan.state in LOCKED_SLOT_STATES
+                and (pose.locked or plan.command.speed != 0)
+            )
+            or localization_required
+        )
+        safe_command = self.motion_safety.apply(
+            plan.command,
+            now=elapsed_s,
+            lidar=lidar,
+            pose=pose,
+            pose_required=self.last_pose_required,
+        )
+        if safe_command != plan.command:
+            plan = replace(
+                plan,
+                command=safe_command,
+                reason=safe_command.reason,
+            )
         self.last_plan = plan
         self.state = replay_state_for_planner(plan.state)
         if plan.state == ParkingState.TRACK_GAP:
             self.positioning_phase = ReplayPositioningPhase.TRACK_FIRST_CAR
-        elif plan.state == ParkingState.PREALIGN_LEFT:
+        elif plan.state in (
+            ParkingState.PROVISIONAL_PREALIGN,
+            ParkingState.PREALIGN_LEFT,
+        ):
             self.positioning_phase = ReplayPositioningPhase.PREALIGN_LEFT
         elif plan.state == ParkingState.POSITION_REAR_AXLE:
             self.positioning_phase = ReplayPositioningPhase.ALIGN_REAR_AXLE
-        self.prealign_confirm_count = self.planner.prealign_confirmed_frames
         if lidar.gap_center_y_back_mm is not None:
             self.tracked_gap_center_y_back_cm = lidar.gap_center_y_back_mm / 10.0
         return ReplayCommand(
@@ -461,6 +474,7 @@ def replay_state_for_planner(state: ParkingState) -> ReplayParkingState:
         return ReplayParkingState.SEARCHING
     if state in (
         ParkingState.POSITION_REAR_AXLE,
+        ParkingState.PROVISIONAL_PREALIGN,
         ParkingState.PREALIGN_LEFT,
         ParkingState.EXIT_RIGHT,
         ParkingState.EXIT_STRAIGHT,
@@ -468,9 +482,15 @@ def replay_state_for_planner(state: ParkingState) -> ReplayParkingState:
         return ReplayParkingState.POSITIONING
     if state in (
         ParkingState.VERIFY_SLOT_BOX,
-        ParkingState.PLAN_REVERSE_PATH,
+        ParkingState.SET_REVERSE_STEER,
         ParkingState.FOLLOW_ENTRY_CURVE,
+        ParkingState.RELEASE_ENTRY_STEER,
         ParkingState.FOLLOW_SLOT_CENTER,
+        ParkingState.CORRECT_FORWARD,
+        ParkingState.CORRECT_REVERSE,
+        ParkingState.PARK_CONFIRM,
+        ParkingState.REACQUIRE_SLOT,
+        ParkingState.FINISH_REVERSE_TIMED,
     ):
         return ReplayParkingState.REVERSING
     if state in (ParkingState.PARKED, ParkingState.EXIT_DONE):
@@ -556,10 +576,6 @@ def run_replay(args: argparse.Namespace) -> Dict[str, object]:
         prealign_target_distance_max_cm=(
             config.planner.prealign_target_distance_max_mm / 10.0
         ),
-        prealign_confirm_cycles=config.planner.prealign_confirm_frames,
-        prealign_heading_overshoot_deg=(
-            config.planner.prealign_heading_overshoot_deg
-        ),
     )
     output_path = resolve_path(args.output)
     summary_path = output_path.with_suffix(".summary.json")
@@ -608,9 +624,9 @@ def run_replay(args: argparse.Namespace) -> Dict[str, object]:
                 "visual_replay": bool(args.show or args.save_video),
                 "saved_video": str(resolve_path(args.save_video)) if args.save_video else None,
                 "limitations": [
-                    "The ZIP has no LEFT/RIGHT ultrasonic samples; side-centering correction and side emergency stop are not replayed.",
+                    "Camera and ultrasonic channels are diagnostics only; shared planner commands use LiDAR.",
                     "Virtual drive/steer commands cannot alter the prerecorded vehicle trajectory.",
-                    "Rear clearance is approximated by the nearest valid LiDAR return around vehicle rear 180 degrees.",
+                    "rear_lidar_cm is a diagnostic approximation and is not used by the shared planner.",
                 ],
             }
         )
@@ -684,13 +700,19 @@ def simulate_scans(
         if rear_cm is not None:
             minimum_rear_cm = rear_cm if minimum_rear_cm is None else min(minimum_rear_cm, rear_cm)
         camera = latest_camera_sample(camera_samples, elapsed)
-        line_error = camera.line_error_px if camera is not None and camera.found else None
         geometry = locked_slot_geometry.update(
             lidar,
             lidar_estimator.vehicle_points(scan),
-            lock_requested=controller.planner_state in LOCKED_SLOT_STATES,
+            lock_requested=(
+                controller.planner_state in SLOT_POSE_TRACKING_STATES
+            ),
         )
-        command = controller.update(lidar, geometry, elapsed)
+        command = controller.update(
+            lidar,
+            geometry,
+            elapsed,
+            locked_slot_geometry.pose,
+        )
         if command.state != previous_state:
             transitions.append(
                 {
@@ -713,46 +735,18 @@ def simulate_scans(
             previous_planner_state = controller.planner_state
 
         rows.append(
-            {
-                "elapsed_s": round(elapsed, 6),
-                "state": command.state.value,
-                "planner_state": controller.planner_state.value,
-                "drive_speed": command.speed,
-                "steer_deg": command.steering_deg,
-                "event": command.event,
-                "gap_found": int(lidar.gap_found),
-                "gap_confirmed": int(lidar.gap_confirmed),
-                "car_clusters": lidar.car_count,
-                "first_car_confirmed": int(lidar.first_car_confirmed),
-                "first_car_edge_y_back_cm": optional_round(
-                    lidar.first_car_slot_edge_y_back_mm,
-                    10.0,
-                ),
-                "first_car_turn_error_cm": optional_round(
-                    lidar.first_car_turn_error_mm,
-                    10.0,
-                ),
-                "first_car_turn_reached": int(lidar.first_car_turn_reached),
-                "gap_center_y_back_cm": optional_round(lidar.gap_center_y_back_mm, 10.0),
-                "gap_width_cm": optional_round(lidar.gap_width_mm, 10.0),
-                "slot_depth_x": optional_round(lidar.slot_depth_x_right),
-                "slot_depth_y": optional_round(lidar.slot_depth_y_back),
-                "gap_coasted": int(lidar.coasted),
-                "positioning_phase": controller.positioning_phase.value,
-                "prealign_confirm_count": controller.prealign_confirm_count,
-                "tracked_gap_center_cm": round(controller.tracked_gap_center_y_back_cm, 3),
-                "gap_confirm_count": controller.gap_confirm_count,
-                "position_confirm_count": controller.position_confirm_count,
-                "finish_confirm_count": controller.finish_confirm_count,
-                "rear_lidar_cm": optional_round(rear_cm),
-                "line_error_px": optional_round(line_error),
-                "camera_found": int(bool(camera and camera.found)),
-                "camera_reason": camera.reason if camera else "not_sampled",
-                "detected_line_masks": camera.detected_line_masks if camera else 0,
-                "fitted_line_count": camera.fitted_line_count if camera else 0,
-                "left_ultrasonic_cm": "",
-                "right_ultrasonic_cm": "",
-            }
+            replay_row(
+                elapsed,
+                command,
+                lidar,
+                rear_cm,
+                camera,
+                controller,
+                geometry,
+                locked_slot_geometry.pose,
+                locked_slot_geometry.landmark_map,
+                locked_slot_geometry.icp_fallback_scans,
+            )
         )
 
     valid_camera = [sample for sample in camera_samples if sample.found]
@@ -785,6 +779,7 @@ def simulate_scans(
         "planner_transitions": planner_transitions,
         "ultrasonic_replayed": False,
     }
+    augment_summary_with_new_diagnostics(summary, rows)
     return rows, summary
 
 
@@ -910,7 +905,7 @@ def run_visual_replay(
                     current_lidar,
                     lidar_estimator.vehicle_points(current_scan),
                     lock_requested=(
-                        controller.planner_state in LOCKED_SLOT_STATES
+                        controller.planner_state in SLOT_POSE_TRACKING_STATES
                     ),
                 )
                 current_rear_cm = rear_lidar_distance_cm(current_scan, config)
@@ -919,6 +914,7 @@ def run_visual_replay(
                     current_lidar,
                     geometry,
                     scan_relative_times[scan_index],
+                    locked_slot_geometry.pose,
                 )
                 if current_command.state != old_state:
                     transition = {
@@ -960,6 +956,10 @@ def run_visual_replay(
                         current_rear_cm,
                         camera,
                         controller,
+                        geometry,
+                        locked_slot_geometry.pose,
+                        locked_slot_geometry.landmark_map,
+                        locked_slot_geometry.icp_fallback_scans,
                     )
                 )
                 scan_index += 1
@@ -1007,6 +1007,8 @@ def run_visual_replay(
                 constants,
                 controller,
                 locked_slot_geometry.pose,
+                locked_slot_geometry.landmark_map,
+                locked_slot_geometry.icp_fallback_scans,
             )
 
             if save_path is not None:
@@ -1109,6 +1111,7 @@ def run_visual_replay(
         "processed_video_frames": len(camera_samples),
         "frame_stride": frame_stride,
     }
+    augment_summary_with_new_diagnostics(summary, rows)
     return rows, summary
 
 
@@ -1117,18 +1120,37 @@ def replay_row(
     command: ReplayCommand,
     lidar: LidarParkingObservation,
     rear_cm: Optional[float],
-    camera: CameraSample,
+    camera: Optional[CameraSample],
     controller: SharedParkingPlannerReplay,
+    geometry: ParkingGeometry = ParkingGeometry(),
+    pose: LockedSlotPose = LockedSlotPose(),
+    landmark_map: Optional[FrozenSlotLandmarkMap] = None,
+    icp_fallback_scans: int = 0,
 ) -> Dict[str, object]:
-    return {
+    path = controller.last_plan.path if controller.last_plan is not None else None
+    lease = controller.motion_safety.snapshot(
+        elapsed_s,
+        pose_required=controller.last_pose_required,
+    )
+    row: Dict[str, object] = {
         "elapsed_s": round(elapsed_s, 6),
         "state": command.state.value,
         "planner_state": controller.planner_state.value,
         "drive_speed": command.speed,
         "steer_deg": command.steering_deg,
         "event": command.event,
+        "lidar_scan_timestamp": optional_round(lidar.timestamp),
+        "lidar_is_new_scan": int(lidar.is_new_scan),
+        "lidar_valid": int(lidar.valid),
+        "lidar_reason": lidar.reason,
         "gap_found": int(lidar.gap_found),
         "gap_confirmed": int(lidar.gap_confirmed),
+        "tracking_roi_expanded": int(lidar.tracking_roi_expanded),
+        "first_car_gate_passed": int(lidar.first_car_gate_passed),
+        "second_car_gate_armed": int(lidar.second_car_gate_armed),
+        "ordered_second_car_pairing": int(
+            lidar.ordered_second_car_pairing
+        ),
         "car_clusters": lidar.car_count,
         "first_car_confirmed": int(lidar.first_car_confirmed),
         "first_car_edge_y_back_cm": optional_round(
@@ -1146,20 +1168,225 @@ def replay_row(
         "slot_depth_y": optional_round(lidar.slot_depth_y_back),
         "gap_coasted": int(lidar.coasted),
         "positioning_phase": controller.positioning_phase.value,
-        "prealign_confirm_count": controller.prealign_confirm_count,
         "tracked_gap_center_cm": round(controller.tracked_gap_center_y_back_cm, 3),
-        "gap_confirm_count": controller.gap_confirm_count,
-        "position_confirm_count": controller.position_confirm_count,
-        "finish_confirm_count": controller.finish_confirm_count,
         "rear_lidar_cm": optional_round(rear_cm),
-        "line_error_px": optional_round(camera.line_error_px if camera.found else None),
-        "camera_found": int(camera.found),
-        "camera_reason": camera.reason,
-        "detected_line_masks": camera.detected_line_masks,
-        "fitted_line_count": camera.fitted_line_count,
+        "line_error_px": optional_round(
+            camera.line_error_px if camera is not None and camera.found else None
+        ),
+        "camera_found": int(bool(camera is not None and camera.found)),
+        "camera_reason": camera.reason if camera is not None else "not_sampled",
+        "detected_line_masks": camera.detected_line_masks if camera is not None else 0,
+        "fitted_line_count": camera.fitted_line_count if camera is not None else 0,
         "left_ultrasonic_cm": "",
         "right_ultrasonic_cm": "",
+        "pose_source": pose.source.value,
+        "pose_locked": int(pose.locked),
+        "pose_tracked": int(pose.tracked),
+        "pose_stale": int(pose.stale),
+        "pose_held": int(pose.held),
+        "pose_lost": int(pose.lost),
+        "pose_scan_timestamp": optional_round(pose.scan_timestamp),
+        "pose_translation_mm": optional_round(pose.translation_mm),
+        "pose_rotation_deg": optional_round(pose.rotation_deg),
+        "pose_support_points": pose.support_points,
+        "pose_bilateral_support": int(pose.bilateral_support),
+        "pose_depth_span_mm": optional_round(pose.depth_span_mm),
+        "pose_reason": pose.reason,
+        "map_frozen": int(bool(landmark_map and landmark_map.frozen)),
+        "map_source_scan_timestamp": optional_round(
+            landmark_map.source_scan_timestamp if landmark_map else None
+        ),
+        "map_slot_width_mm": optional_round(
+            landmark_map.slot_width_mm if landmark_map else None
+        ),
+        "map_slot_depth_mm": optional_round(
+            landmark_map.slot_depth_mm if landmark_map else None
+        ),
+        "map_landmark_count": len(landmark_map.landmarks) if landmark_map else 0,
+        "map_landmarks_local_mm": (
+            "|".join(
+                "%s:%.3f:%.3f"
+                % (
+                    landmark.landmark_id,
+                    landmark.local_x_mm,
+                    landmark.local_y_mm,
+                )
+                for landmark in landmark_map.landmarks
+            )
+            if landmark_map
+            else ""
+        ),
+        "map_surface_point_count": (
+            len(landmark_map.surface_points_local) if landmark_map else 0
+        ),
+        "map_surface_points_local_mm": (
+            "|".join(
+                "%.3f:%.3f" % point
+                for point in landmark_map.surface_points_local
+            )
+            if landmark_map
+            else ""
+        ),
+        "map_reason": landmark_map.reason if landmark_map else "",
+        "map_icp_fallback_scans": icp_fallback_scans,
+        "path_status": path.status.value if path is not None else "",
+        "path_found": int(bool(path and path.found)),
+        "path_reason": path.reason if path is not None else "",
+        "path_point_count": len(path.points) if path is not None else 0,
+        "path_points_px": (
+            "|".join("%.3f:%.3f" % point for point in path.points)
+            if path is not None
+            else ""
+        ),
+        "path_curvature_per_px": optional_round(
+            path.curvature_per_px if path is not None else None
+        ),
+        "path_maximum_curvature_per_px": optional_round(
+            path.maximum_curvature_per_px if path is not None else None
+        ),
+        "path_entry_steering_ratio": optional_round(
+            path.entry_steering_ratio if path is not None else None
+        ),
+        "path_entry_heading_change_deg": optional_round(
+            path.entry_heading_change_deg if path is not None else None
+        ),
+        "path_final_lateral_offset_px": optional_round(
+            path.final_lateral_offset_px if path is not None else None
+        ),
+        "path_minimum_side_clearance_px": optional_round(
+            path.minimum_side_clearance_px if path is not None else None
+        ),
+        "path_maximum_entry_depth_px": optional_round(
+            path.maximum_entry_depth_px if path is not None else None
+        ),
+        "path_lookahead_x_px": optional_round(
+            path.lookahead_point[0]
+            if path is not None and path.lookahead_point is not None
+            else None
+        ),
+        "path_lookahead_y_px": optional_round(
+            path.lookahead_point[1]
+            if path is not None and path.lookahead_point is not None
+            else None
+        ),
+        "lease_pose_required": int(lease.pose_required),
+        "lease_valid": int(lease.lease_valid),
+        "lease_expires_at_s": optional_round(lease.lease_expires_at),
+        "lease_remaining_s": optional_round(lease.lease_remaining_s),
+        "lease_last_fresh_pose_at_s": optional_round(
+            lease.last_fresh_pose_at
+        ),
+        "lease_pose_age_s": optional_round(lease.pose_age_s),
+        "footprint_completion_candidate": int(
+            geometry.park_completion_candidate
+        ),
+        "footprint_completion_reason": geometry.park_completion_reason,
+        "footprint_min_lateral_mm": optional_round(
+            geometry.vehicle_footprint_min_lateral_mm
+        ),
+        "footprint_max_lateral_mm": optional_round(
+            geometry.vehicle_footprint_max_lateral_mm
+        ),
+        "footprint_min_depth_mm": optional_round(
+            geometry.vehicle_footprint_min_depth_mm
+        ),
+        "footprint_max_depth_mm": optional_round(
+            geometry.vehicle_footprint_max_depth_mm
+        ),
     }
+    for index in range(4):
+        point = pose.polygon[index] if pose.polygon is not None else None
+        row["pose_p%d_x_right_mm" % index] = optional_round(
+            point[0] if point is not None else None
+        )
+        row["pose_p%d_y_back_mm" % index] = optional_round(
+            point[1] if point is not None else None
+        )
+    return row
+
+
+def augment_summary_with_new_diagnostics(
+    summary: Dict[str, object],
+    rows: Sequence[Dict[str, object]],
+) -> None:
+    direct_axes = []
+    for row in rows:
+        if row["pose_source"] != "DIRECT_PAIR":
+            continue
+        values = (
+            row["pose_p0_x_right_mm"],
+            row["pose_p0_y_back_mm"],
+            row["pose_p1_x_right_mm"],
+            row["pose_p1_y_back_mm"],
+        )
+        if any(value == "" for value in values):
+            continue
+        axis_x = float(values[2]) - float(values[0])
+        axis_y = float(values[3]) - float(values[1])
+        length = math.hypot(axis_x, axis_y)
+        if length > 1e-9:
+            direct_axes.append((axis_x / length, axis_y / length))
+    direct_pair_axis_flip_count = sum(
+        first[0] * second[0] + first[1] * second[1] < 0.0
+        for first, second in zip(direct_axes, direct_axes[1:])
+    )
+    summary.update(
+        {
+            "pose_source_counts": dict(
+                Counter(str(row["pose_source"]) for row in rows)
+            ),
+            "pose_reason_counts": dict(
+                Counter(str(row["pose_reason"]) for row in rows)
+            ),
+            "path_status_counts": dict(
+                Counter(
+                    str(row["path_status"])
+                    for row in rows
+                    if row["path_status"] != ""
+                )
+            ),
+            "map_frozen_scans": sum(row["map_frozen"] == 1 for row in rows),
+            "maximum_map_icp_fallback_scans": max(
+                (int(row["map_icp_fallback_scans"]) for row in rows),
+                default=0,
+            ),
+            "lease_required_scans": sum(
+                row["lease_pose_required"] == 1 for row in rows
+            ),
+            "lease_valid_scans": sum(
+                row["lease_valid"] == 1 for row in rows
+            ),
+            "lease_stop_scans": sum(
+                str(row["event"]).startswith("motion_safety:")
+                or str(row["event"]).startswith("lidar_unavailable:")
+                for row in rows
+            ),
+            "park_completion_candidate_scans": sum(
+                row["footprint_completion_candidate"] == 1
+                for row in rows
+            ),
+            "pose_lost_scans": sum(
+                row["pose_lost"] == 1 for row in rows
+            ),
+            "pose_bilateral_support_scans": sum(
+                row["pose_bilateral_support"] == 1 for row in rows
+            ),
+            "map_localized_scans": sum(
+                row["pose_reason"] == "slot_map_localized"
+                for row in rows
+            ),
+            "map_depth_unobservable_scans": sum(
+                row["pose_reason"] == "slot_map_depth_unobservable"
+                for row in rows
+            ),
+            "direct_pair_axis_flip_count": direct_pair_axis_flip_count,
+            "side_boundary_collision_scans": sum(
+                row["path_reason"]
+                == "vehicle_footprint_crosses_side_boundary"
+                for row in rows
+            ),
+        }
+    )
 
 
 def draw_arduino_dashboard(
@@ -1180,6 +1407,8 @@ def draw_arduino_dashboard(
     constants: ArduinoReplayConstants,
     controller: SharedParkingPlannerReplay,
     locked_slot_pose: LockedSlotPose,
+    slot_landmark_map: Optional[FrozenSlotLandmarkMap],
+    icp_fallback_scans: int = 0,
 ) -> object:
     rear_display = frame.copy()
     mask_geometry = (
@@ -1239,6 +1468,8 @@ def draw_arduino_dashboard(
         controller.last_plan,
         slot_polygon=locked_slot_pose.polygon,
         slot_status=locked_slot_pose.reason,
+        slot_landmark_map=slot_landmark_map,
+        slot_pose=locked_slot_pose,
     )
 
     center_cm = (
@@ -1246,7 +1477,11 @@ def draw_arduino_dashboard(
         else lidar.gap_center_y_back_mm / 10.0
     )
     width_cm = None if lidar.gap_width_mm is None else lidar.gap_width_mm / 10.0
-    line_error = camera.line_error_px if camera.found else None
+    path = controller.last_plan.path if controller.last_plan is not None else None
+    safety = controller.motion_safety.snapshot(
+        elapsed_s,
+        pose_required=controller.last_pose_required,
+    )
     status_lines = (
         "OFFLINE ZIP REPLAY - MOTOR OUTPUT DISABLED",
         "STATE %-22s drive=%+3d steer=%+4d event=%s" % (
@@ -1255,44 +1490,27 @@ def draw_arduino_dashboard(
             command.steering_deg,
             command.event or "-",
         ),
-        "LiDAR cars=%d gap=%s centerY=%s cm width=%s cm rear=%s cm" % (
+        "LiDAR scan=%.3f new=%s cars=%d gap=%s centerY=%s width=%s rear=%s cm" % (
+            lidar.timestamp if lidar.timestamp is not None else -1.0,
+            "Y" if lidar.is_new_scan else "N",
             lidar.car_count,
             "CONFIRMED" if lidar.gap_confirmed else ("candidate" if lidar.gap_found else "no"),
             format_optional(center_cm, signed=True),
             format_optional(width_cm),
             format_optional(rear_cm),
         ),
-        "FIRST CAR edgeY=%s cm target=%+.1f cm error=%s cm turn=%s" % (
-            format_optional(
-                None
-                if lidar.first_car_slot_edge_y_back_mm is None
-                else lidar.first_car_slot_edge_y_back_mm / 10.0,
-                signed=True,
-            ),
-            config.lidar.first_car_turn_target_y_back_mm / 10.0,
-            format_optional(
-                None
-                if lidar.first_car_turn_error_mm is None
-                else lidar.first_car_turn_error_mm / 10.0,
-                signed=True,
-            ),
-            "READY" if lidar.first_car_turn_reached else "waiting",
+        "POSE %s" % format_locked_slot_pose_status(locked_slot_pose),
+        "MAP %s | icp=%d" % (
+            format_slot_landmark_map_status(slot_landmark_map),
+            icp_fallback_scans,
         ),
-        "POSITION %s center=%s prealign=%d/%d" % (
-            controller.positioning_phase.value,
-            format_optional(controller.tracked_gap_center_y_back_cm, signed=True),
-            controller.prealign_confirm_count,
-            config.planner.prealign_confirm_frames,
-        ),
-        "CAM masks=%d fitted=%d validPair=%s lineError=%s px reason=%s" % (
-            camera.detected_line_masks,
-            camera.fitted_line_count,
+        "PATH %s" % format_reverse_path_status(path),
+        "LEASE %s" % format_motion_safety_status(safety),
+        "FOOTPRINT %s | CAM=%s (%s)" % (
+            format_slot_footprint_status(geometry),
             "Y" if camera.found else "N",
-            format_optional(line_error, signed=True),
             camera.reason,
         ),
-        "ULTRASONIC LEFT=N/A RIGHT=N/A (not present in this recording)",
-        "Colors: CYAN=left GREEN=right RED=back MAGENTA=unclassified | SPACE pause Q quit",
     )
     return compose_parking_dashboard(
         cv2,
@@ -1444,7 +1662,7 @@ def resolve_path(value: str) -> Path:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Replay an MP4+LiDAR ZIP through the Arduino T-parking logic"
+        description="Replay an MP4+LiDAR ZIP through the shared T-parking planner"
     )
     parser.add_argument("--recording-zip", required=True, help="ZIP containing one MP4 and one *_lidar.csv")
     parser.add_argument("--config", default="configs/parking.json")

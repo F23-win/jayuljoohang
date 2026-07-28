@@ -118,6 +118,26 @@ class LidarParkingConfig:
     first_car_confirm_scans: int = 2
     first_car_min_x_right_mm: float = 250.0
     first_car_turn_target_y_back_mm: float = -650.0
+    # The first bordering car is detected in the narrow right-side approach
+    # ROI. Once it is confirmed, the ego vehicle starts turning left and that
+    # same car can move into the left half-plane. Latch the wider parking-work
+    # ROI for the rest of the mission instead of dropping back to the narrow
+    # initial detector.
+    expand_roi_after_first_car: bool = False
+    # While turning left, the next bordering car enters a small gate beside the
+    # right rear quarter. Track the first car across the expanded ROI, wait
+    # until it has passed this gate, and only then accept a new sparse cluster
+    # entering the same gate. Gate y values are relative to the rear axle so a
+    # measured LiDAR mounting offset can be changed independently.
+    ordered_second_car_pairing_after_first_car: bool = False
+    second_car_gate_x_min_right_mm: float = 800.0
+    second_car_gate_x_max_right_mm: float = 2600.0
+    second_car_gate_y_from_rear_axle_min_mm: float = -700.0
+    second_car_gate_y_from_rear_axle_max_mm: float = 500.0
+    first_car_passed_y_from_rear_axle_min_mm: float = 500.0
+    first_car_track_max_jump_mm: float = 600.0
+    ordered_gap_pair_min_points: int = 4
+    ordered_gap_confirm_scans: int = 1
 
     # Positive y_back is behind the sensor. The LiDAR is provisionally 30 cm
     # behind the rear axle, so the rear axle is at negative y_back. Replace this
@@ -129,8 +149,40 @@ class LidarParkingConfig:
 
 
 @dataclass(frozen=True)
+class RawTwoCarGapMeasurement:
+    """Unfiltered gap geometry measured from one complete LiDAR scan.
+
+    Unlike the gap fields on ``LidarParkingObservation``, these values have not
+    been smoothed, coasted, or reconstructed from a single visible border car.
+    ``scan_timestamp`` is the identity of the complete scan that produced the
+    measurement.
+    """
+
+    scan_timestamp: float
+    observed_width_mm: float
+    first_edge_x_right_mm: float
+    first_edge_y_back_mm: float
+    second_edge_x_right_mm: float
+    second_edge_y_back_mm: float
+    slot_depth_x_right: float
+    slot_depth_y_back: float
+
+    @property
+    def center_x_right_mm(self) -> float:
+        return (self.first_edge_x_right_mm + self.second_edge_x_right_mm) / 2.0
+
+    @property
+    def center_y_back_mm(self) -> float:
+        return (self.first_edge_y_back_mm + self.second_edge_y_back_mm) / 2.0
+
+
+@dataclass(frozen=True)
 class LidarParkingObservation:
     timestamp: float = 0.0
+    # A complete RPLidar revolution has one timestamp. Runtime loops can see
+    # the same latest revolution more than once, so confirmation counters must
+    # use this flag rather than treating every estimator call as new evidence.
+    is_new_scan: bool = False
     valid: bool = False
     unsafe: bool = False
     observed_points: int = 0
@@ -146,6 +198,12 @@ class LidarParkingObservation:
     gap_found: bool = False
     gap_confirmed: bool = False
     gap_pair_observed: bool = False
+    gap_single_cluster_observed: bool = False
+    tracking_roi_expanded: bool = False
+    first_car_gate_passed: bool = False
+    second_car_gate_armed: bool = False
+    ordered_second_car_pairing: bool = False
+    raw_two_car_gap: Optional[RawTwoCarGapMeasurement] = None
     gap_width_mm: Optional[float] = None
     gap_near_edge_x_right_mm: Optional[float] = None
     gap_near_edge_y_back_mm: Optional[float] = None
@@ -177,6 +235,10 @@ class LidarParkingSpaceEstimator:
         self.config = config
         self._last_timestamp: Optional[float] = None
         self._first_car_confirm_scans = 0
+        self._first_car_acquired = False
+        self._tracked_first_car_x_mm: Optional[float] = None
+        self._tracked_first_car_y_mm: Optional[float] = None
+        self._first_car_gate_passed = False
         self._candidate_center_x_mm: Optional[float] = None
         self._candidate_center_mm: Optional[float] = None
         self._last_candidate_timestamp: Optional[float] = None
@@ -198,6 +260,10 @@ class LidarParkingSpaceEstimator:
     def reset(self) -> None:
         self._last_timestamp = None
         self._first_car_confirm_scans = 0
+        self._first_car_acquired = False
+        self._tracked_first_car_x_mm = None
+        self._tracked_first_car_y_mm = None
+        self._first_car_gate_passed = False
         self._candidate_center_x_mm = None
         self._candidate_center_mm = None
         self._last_candidate_timestamp = None
@@ -233,9 +299,16 @@ class LidarParkingSpaceEstimator:
             return LidarParkingObservation(timestamp=scan.timestamp, reason="stale_scan")
 
         transformed = [value for value in (self._transform(point) for point in scan.points) if value]
+        tracking_roi_expanded = (
+            self.config.expand_roi_after_first_car
+            and self._first_car_acquired
+        )
         cluster_roi = (
             self.config.slot_tracking_roi
-            if self._confirmed and self.config.slot_tracking_roi is not None
+            if (
+                (self._confirmed or tracking_roi_expanded)
+                and self.config.slot_tracking_roi is not None
+            )
             else self.config.car_detection_roi
         )
         car_points = [
@@ -262,36 +335,7 @@ class LidarParkingSpaceEstimator:
             len(transformed) >= max(1, self.config.min_observed_points)
             or len(car_points) >= max(1, self.config.car_cluster_min_points)
         )
-        reference_depth = (
-            (self._tracked_depth_x, self._tracked_depth_y)
-            if self._tracked_depth_x is not None and self._tracked_depth_y is not None
-            else None
-        )
-        reference_center = (
-            (self._candidate_center_x_mm, self._candidate_center_mm)
-            if self._candidate_center_x_mm is not None and self._candidate_center_mm is not None
-            else None
-        )
-        candidate = (
-            choose_gap(
-                clusters,
-                self.config,
-                reference_depth=reference_depth,
-                reference_center=reference_center,
-            )
-            if valid
-            else None
-        )
-        if candidate is not None and self._confirmed and not self._track_consistent(candidate):
-            # A confirmed physical slot must not be replaced by a different
-            # cluster pair or a 90/180-degree pose jump. Retain the previous
-            # pose briefly and wait for a consistent observation.
-            candidate = None
-        gap_pair_observed = candidate is not None
-        if candidate is None and valid and self._confirmed:
-            candidate = self._track_gap_from_single_cluster(clusters)
         new_scan = self._last_timestamp != scan.timestamp
-
         first_car = select_first_approach_car(clusters, self.config) if valid else None
         if new_scan:
             if first_car is None:
@@ -303,6 +347,91 @@ class LidarParkingSpaceEstimator:
             and self._first_car_confirm_scans
             >= max(1, self.config.first_car_confirm_scans)
         )
+        if first_car_confirmed:
+            self._first_car_acquired = True
+        tracked_first_car = self._match_tracked_first_car(
+            clusters,
+            first_car if first_car_confirmed else None,
+            update=new_scan,
+        )
+        if (
+            tracked_first_car is not None
+            and tracked_first_car.center_y_back_mm
+            - self.config.sensor_to_rear_axle_y_back_mm
+            >= self.config.first_car_passed_y_from_rear_axle_min_mm
+        ):
+            self._first_car_gate_passed = True
+        ordered_pairing_active = (
+            tracking_roi_expanded
+            and self.config.ordered_second_car_pairing_after_first_car
+            and self._first_car_gate_passed
+        )
+        second_car = (
+            select_second_car_in_rear_gate(
+                clusters,
+                self.config,
+                excluded=tracked_first_car,
+            )
+            if ordered_pairing_active
+            else None
+        )
+        reference_depth = (
+            (self._tracked_depth_x, self._tracked_depth_y)
+            if self._tracked_depth_x is not None and self._tracked_depth_y is not None
+            else None
+        )
+        reference_center = (
+            (self._candidate_center_x_mm, self._candidate_center_mm)
+            if self._candidate_center_x_mm is not None and self._candidate_center_mm is not None
+            else None
+        )
+        if not valid:
+            candidate = None
+        elif self.config.ordered_second_car_pairing_after_first_car:
+            candidate = (
+                choose_gap(
+                    clusters,
+                    self.config,
+                    reference_depth=reference_depth,
+                    reference_center=reference_center,
+                    ordered_pairing=True,
+                    ordered_first_car=tracked_first_car,
+                )
+                if ordered_pairing_active and second_car is not None
+                else None
+            )
+        else:
+            candidate = choose_gap(
+                clusters,
+                self.config,
+                reference_depth=reference_depth,
+                reference_center=reference_center,
+            )
+        if candidate is not None and self._confirmed and not self._track_consistent(candidate):
+            # A confirmed physical slot must not be replaced by a different
+            # cluster pair or a 90/180-degree pose jump. Retain the previous
+            # pose briefly and wait for a consistent observation.
+            candidate = None
+        gap_pair_observed = candidate is not None
+        gap_single_cluster_observed = False
+        raw_two_car_gap = (
+            RawTwoCarGapMeasurement(
+                scan_timestamp=scan.timestamp,
+                observed_width_mm=candidate[0],
+                first_edge_x_right_mm=candidate[3],
+                first_edge_y_back_mm=candidate[1],
+                second_edge_x_right_mm=candidate[4],
+                second_edge_y_back_mm=candidate[2],
+                slot_depth_x_right=candidate[5],
+                slot_depth_y_back=candidate[6],
+            )
+            if new_scan and candidate is not None
+            else None
+        )
+        if candidate is None and valid and self._confirmed:
+            candidate = self._track_gap_from_single_cluster(clusters)
+            gap_single_cluster_observed = candidate is not None
+
         first_car_edge_x = (
             (first_car.x_min_mm + first_car.x_max_mm) / 2.0
             if first_car is not None
@@ -326,7 +455,16 @@ class LidarParkingSpaceEstimator:
         )
 
         if new_scan:
-            self._update_tracking(candidate, scan.timestamp)
+            required_confirm_scans = (
+                self.config.ordered_gap_confirm_scans
+                if ordered_pairing_active
+                else self.config.gap_confirm_scans
+            )
+            self._update_tracking(
+                candidate,
+                scan.timestamp,
+                required_confirm_scans=required_confirm_scans,
+            )
             self._last_timestamp = scan.timestamp
 
         gap = self._last_gap if candidate is not None and self._last_gap is not None else candidate
@@ -373,10 +511,25 @@ class LidarParkingSpaceEstimator:
         elif self._confirmed and gap_found:
             reason = "gap_confirmed"
         elif candidate is not None:
+            required_confirm_scans = (
+                self.config.ordered_gap_confirm_scans
+                if ordered_pairing_active
+                else self.config.gap_confirm_scans
+            )
             reason = "gap_confirming:%d/%d" % (
                 self._confirm_scans,
-                max(1, self.config.gap_confirm_scans),
+                max(1, required_confirm_scans),
             )
+        elif (
+            self.config.ordered_second_car_pairing_after_first_car
+            and self._first_car_acquired
+            and not self._first_car_gate_passed
+        ):
+            reason = "tracking_first_car_to_rear_gate"
+        elif ordered_pairing_active and second_car is None:
+            reason = "waiting_for_second_car_rear_gate"
+        elif ordered_pairing_active:
+            reason = "ordered_pair_invalid_gap"
         elif len(clusters) == 1:
             reason = "one_parked_car"
         elif len(clusters) >= 2:
@@ -386,6 +539,7 @@ class LidarParkingSpaceEstimator:
 
         return LidarParkingObservation(
             timestamp=scan.timestamp,
+            is_new_scan=new_scan,
             valid=valid,
             unsafe=unsafe,
             observed_points=len(transformed),
@@ -397,10 +551,20 @@ class LidarParkingSpaceEstimator:
             first_car_slot_edge_y_back_mm=first_car_edge_y,
             first_car_turn_error_mm=first_car_turn_error,
             first_car_turn_reached=first_car_turn_reached,
-            second_car_seen=len(clusters) >= 2,
+            second_car_seen=(
+                second_car is not None
+                if self.config.ordered_second_car_pairing_after_first_car
+                else len(clusters) >= 2
+            ),
             gap_found=gap_found,
             gap_confirmed=self._confirmed and gap_found,
             gap_pair_observed=gap_pair_observed,
+            gap_single_cluster_observed=gap_single_cluster_observed,
+            tracking_roi_expanded=tracking_roi_expanded,
+            first_car_gate_passed=self._first_car_gate_passed,
+            second_car_gate_armed=ordered_pairing_active,
+            ordered_second_car_pairing=ordered_pairing_active,
+            raw_two_car_gap=raw_two_car_gap,
             gap_width_mm=gap_width,
             gap_near_edge_x_right_mm=near_edge_x,
             gap_near_edge_y_back_mm=near_edge,
@@ -419,10 +583,49 @@ class LidarParkingSpaceEstimator:
             reason=reason,
         )
 
+    def _match_tracked_first_car(
+        self,
+        clusters: Sequence[CarCluster],
+        initial: Optional[CarCluster],
+        *,
+        update: bool,
+    ) -> Optional[CarCluster]:
+        if not self._first_car_acquired:
+            return None
+        if (
+            self._tracked_first_car_x_mm is None
+            or self._tracked_first_car_y_mm is None
+        ):
+            matched = initial
+        else:
+            matched = min(
+                clusters,
+                key=lambda cluster: hypot(
+                    cluster.center_x_right_mm - self._tracked_first_car_x_mm,
+                    cluster.center_y_back_mm - self._tracked_first_car_y_mm,
+                ),
+                default=None,
+            )
+            if (
+                matched is not None
+                and hypot(
+                    matched.center_x_right_mm - self._tracked_first_car_x_mm,
+                    matched.center_y_back_mm - self._tracked_first_car_y_mm,
+                )
+                > max(0.0, self.config.first_car_track_max_jump_mm)
+            ):
+                matched = None
+        if matched is not None and update:
+            self._tracked_first_car_x_mm = matched.center_x_right_mm
+            self._tracked_first_car_y_mm = matched.center_y_back_mm
+        return matched
+
     def _update_tracking(
         self,
         gap: Optional[Tuple[float, float, float, float, float, float, float]],
         timestamp: float,
+        *,
+        required_confirm_scans: int,
     ) -> None:
         if gap is None:
             if self._confirmed and self._last_gap is not None:
@@ -550,7 +753,7 @@ class LidarParkingSpaceEstimator:
                 self._tracked_depth_y,
             )
         self._coast_scans = 0
-        if self._confirm_scans >= max(1, self.config.gap_confirm_scans):
+        if self._confirm_scans >= max(1, required_confirm_scans):
             self._confirmed = True
 
     def _track_gap_from_single_cluster(
@@ -728,6 +931,51 @@ def is_gap_cluster_eligible(
     )
 
 
+def is_inside_second_car_rear_gate(
+    cluster: CarCluster,
+    config: LidarParkingConfig,
+) -> bool:
+    y_from_rear_axle = (
+        cluster.center_y_back_mm - config.sensor_to_rear_axle_y_back_mm
+    )
+    return (
+        config.second_car_gate_x_min_right_mm
+        <= cluster.center_x_right_mm
+        <= config.second_car_gate_x_max_right_mm
+        and config.second_car_gate_y_from_rear_axle_min_mm
+        <= y_from_rear_axle
+        <= config.second_car_gate_y_from_rear_axle_max_mm
+    )
+
+
+def select_second_car_in_rear_gate(
+    clusters: Sequence[CarCluster],
+    config: LidarParkingConfig,
+    *,
+    excluded: Optional[CarCluster] = None,
+) -> Optional[CarCluster]:
+    candidates = [
+        cluster
+        for cluster in clusters
+        if cluster is not excluded
+        and is_inside_second_car_rear_gate(cluster, config)
+    ]
+    if not candidates:
+        return None
+    gate_center_y = (
+        config.sensor_to_rear_axle_y_back_mm
+        + (
+            config.second_car_gate_y_from_rear_axle_min_mm
+            + config.second_car_gate_y_from_rear_axle_max_mm
+        )
+        / 2.0
+    )
+    return min(
+        candidates,
+        key=lambda cluster: abs(cluster.center_y_back_mm - gate_center_y),
+    )
+
+
 def cluster_slot_edge(
     cluster: CarCluster,
     axis_x: float,
@@ -758,6 +1006,9 @@ def choose_gap(
     config: LidarParkingConfig,
     reference_depth: Optional[Tuple[float, float]] = None,
     reference_center: Optional[Tuple[float, float]] = None,
+    *,
+    ordered_pairing: bool = False,
+    ordered_first_car: Optional[CarCluster] = None,
 ) -> Optional[Tuple[float, float, float, float, float, float, float]]:
     """Return the best oriented gap between any two parked-car clusters.
 
@@ -770,15 +1021,27 @@ def choose_gap(
     rotates and one car enters the left half-plane.
     """
 
-    gap_clusters = tuple(
-        cluster for cluster in clusters
-        if is_gap_cluster_eligible(cluster, config)
-    )
-    min_pair_points = max(
-        2,
-        config.gap_pair_min_points,
-        2 * max(1, config.gap_cluster_min_points),
-    )
+    if ordered_pairing:
+        gap_clusters = tuple(
+            cluster
+            for cluster in clusters
+            if cluster.point_count >= max(1, config.car_cluster_min_points)
+        )
+        min_pair_points = max(
+            2,
+            config.ordered_gap_pair_min_points,
+            2 * max(1, config.car_cluster_min_points),
+        )
+    else:
+        gap_clusters = tuple(
+            cluster for cluster in clusters
+            if is_gap_cluster_eligible(cluster, config)
+        )
+        min_pair_points = max(
+            2,
+            config.gap_pair_min_points,
+            2 * max(1, config.gap_cluster_min_points),
+        )
     candidates = []
     for first_index, first in enumerate(gap_clusters):
         first_center_x = first.center_x_right_mm
@@ -786,6 +1049,24 @@ def choose_gap(
         for second in gap_clusters[first_index + 1:]:
             if first.point_count + second.point_count < min_pair_points:
                 continue
+            if ordered_pairing:
+                if ordered_first_car is first:
+                    arriving_second_car = second
+                elif ordered_first_car is second:
+                    arriving_second_car = first
+                else:
+                    continue
+                if (
+                    ordered_first_car.center_y_back_mm
+                    - config.sensor_to_rear_axle_y_back_mm
+                    < config.first_car_passed_y_from_rear_axle_min_mm
+                ):
+                    continue
+                if not is_inside_second_car_rear_gate(
+                    arriving_second_car,
+                    config,
+                ):
+                    continue
             second_center_x = second.center_x_right_mm
             second_center_y = second.center_y_back_mm
             axis_x = second_center_x - first_center_x
@@ -815,7 +1096,8 @@ def choose_gap(
             if center_x < config.gap_center_x_min_mm:
                 continue
             if (
-                reference_center is None
+                not ordered_pairing
+                and reference_center is None
                 and center_y < config.gap_center_y_back_min_mm
             ):
                 continue

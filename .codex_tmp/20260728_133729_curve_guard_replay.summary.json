@@ -1,0 +1,289 @@
+{
+  "lidar_scans": 588,
+  "duration_s": 65.769,
+  "gap_confirmed_scans": 386,
+  "gap_hold_scans": 114,
+  "slot_depth_flip_count": 0,
+  "minimum_consecutive_slot_depth_dot": 0.998,
+  "closest_gap_center_abs_cm": 1.362,
+  "minimum_rear_lidar_cm": 98.775,
+  "camera_samples": 0,
+  "camera_valid_samples": 0,
+  "camera_valid_ratio": null,
+  "camera_samples_with_line_mask": 0,
+  "camera_samples_with_two_masks": 0,
+  "camera_geometry_reason_counts": {},
+  "final_state": "POSITIONING",
+  "final_planner_state": "provisional_prealign",
+  "transitions": [
+    {
+      "elapsed_s": 11.426,
+      "from": "SEARCHING",
+      "to": "POSITIONING",
+      "event": "first_car_turn_reached:provisional_settle_max_left"
+    },
+    {
+      "elapsed_s": 43.793,
+      "from": "POSITIONING",
+      "to": "REVERSING",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 44.578,
+      "from": "REVERSING",
+      "to": "POSITIONING",
+      "event": "slot_reacquire_timeout:resume_provisional_prealign"
+    },
+    {
+      "elapsed_s": 44.69,
+      "from": "POSITIONING",
+      "to": "REVERSING",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 45.472,
+      "from": "REVERSING",
+      "to": "POSITIONING",
+      "event": "slot_reacquire_timeout:resume_provisional_prealign"
+    },
+    {
+      "elapsed_s": 50.293,
+      "from": "POSITIONING",
+      "to": "REVERSING",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 50.405,
+      "from": "REVERSING",
+      "to": "POSITIONING",
+      "event": "reverse_path_not_armable:collision_risk:vehicle_footprint_crosses_side_boundary:resume_provisional_prealign"
+    },
+    {
+      "elapsed_s": 50.519,
+      "from": "POSITIONING",
+      "to": "REVERSING",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 51.305,
+      "from": "REVERSING",
+      "to": "POSITIONING",
+      "event": "slot_reacquire_timeout:resume_provisional_prealign"
+    },
+    {
+      "elapsed_s": 51.864,
+      "from": "POSITIONING",
+      "to": "REVERSING",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 52.649,
+      "from": "REVERSING",
+      "to": "POSITIONING",
+      "event": "slot_reacquire_timeout:resume_provisional_prealign"
+    },
+    {
+      "elapsed_s": 52.982,
+      "from": "POSITIONING",
+      "to": "REVERSING",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 53.768,
+      "from": "REVERSING",
+      "to": "POSITIONING",
+      "event": "slot_reacquire_timeout:resume_provisional_prealign"
+    },
+    {
+      "elapsed_s": 54.218,
+      "from": "POSITIONING",
+      "to": "REVERSING",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 55.003,
+      "from": "REVERSING",
+      "to": "POSITIONING",
+      "event": "slot_reacquire_timeout:resume_provisional_prealign"
+    }
+  ],
+  "planner_transitions": [
+    {
+      "elapsed_s": 11.426,
+      "from": "search_cars",
+      "to": "provisional_prealign",
+      "event": "first_car_turn_reached:provisional_settle_max_left"
+    },
+    {
+      "elapsed_s": 43.793,
+      "from": "provisional_prealign",
+      "to": "verify_slot_box",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 43.904,
+      "from": "verify_slot_box",
+      "to": "reacquire_slot",
+      "event": "slot_arm_geometry_unavailable"
+    },
+    {
+      "elapsed_s": 44.578,
+      "from": "reacquire_slot",
+      "to": "provisional_prealign",
+      "event": "slot_reacquire_timeout:resume_provisional_prealign"
+    },
+    {
+      "elapsed_s": 44.69,
+      "from": "provisional_prealign",
+      "to": "verify_slot_box",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 44.8,
+      "from": "verify_slot_box",
+      "to": "reacquire_slot",
+      "event": "slot_arm_geometry_unavailable"
+    },
+    {
+      "elapsed_s": 45.472,
+      "from": "reacquire_slot",
+      "to": "provisional_prealign",
+      "event": "slot_reacquire_timeout:resume_provisional_prealign"
+    },
+    {
+      "elapsed_s": 50.293,
+      "from": "provisional_prealign",
+      "to": "verify_slot_box",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 50.405,
+      "from": "verify_slot_box",
+      "to": "provisional_prealign",
+      "event": "reverse_path_not_armable:collision_risk:vehicle_footprint_crosses_side_boundary:resume_provisional_prealign"
+    },
+    {
+      "elapsed_s": 50.519,
+      "from": "provisional_prealign",
+      "to": "verify_slot_box",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 50.631,
+      "from": "verify_slot_box",
+      "to": "reacquire_slot",
+      "event": "slot_arm_geometry_unavailable"
+    },
+    {
+      "elapsed_s": 51.305,
+      "from": "reacquire_slot",
+      "to": "provisional_prealign",
+      "event": "slot_reacquire_timeout:resume_provisional_prealign"
+    },
+    {
+      "elapsed_s": 51.864,
+      "from": "provisional_prealign",
+      "to": "verify_slot_box",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 51.977,
+      "from": "verify_slot_box",
+      "to": "reacquire_slot",
+      "event": "slot_arm_geometry_unavailable"
+    },
+    {
+      "elapsed_s": 52.649,
+      "from": "reacquire_slot",
+      "to": "provisional_prealign",
+      "event": "slot_reacquire_timeout:resume_provisional_prealign"
+    },
+    {
+      "elapsed_s": 52.982,
+      "from": "provisional_prealign",
+      "to": "verify_slot_box",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 53.096,
+      "from": "verify_slot_box",
+      "to": "reacquire_slot",
+      "event": "slot_arm_geometry_unavailable"
+    },
+    {
+      "elapsed_s": 53.768,
+      "from": "reacquire_slot",
+      "to": "provisional_prealign",
+      "event": "slot_reacquire_timeout:resume_provisional_prealign"
+    },
+    {
+      "elapsed_s": 54.218,
+      "from": "provisional_prealign",
+      "to": "verify_slot_box",
+      "event": "provisional_safe_path_ready"
+    },
+    {
+      "elapsed_s": 54.328,
+      "from": "verify_slot_box",
+      "to": "reacquire_slot",
+      "event": "slot_arm_geometry_unavailable"
+    },
+    {
+      "elapsed_s": 55.003,
+      "from": "reacquire_slot",
+      "to": "provisional_prealign",
+      "event": "slot_reacquire_timeout:resume_provisional_prealign"
+    }
+  ],
+  "ultrasonic_replayed": false,
+  "pose_source_counts": {
+    "NONE": 575,
+    "DIRECT_PAIR": 3,
+    "MAP_LOCALIZATION": 3,
+    "DIRECT_PAIR_CORRECTION": 7
+  },
+  "pose_reason_counts": {
+    "slot_not_locked": 399,
+    "locked_slot_fallback_unavailable": 176,
+    "direct_pair": 3,
+    "slot_map_localized": 2,
+    "direct_pair_gated_correction": 7,
+    "direct_pair_jump_rejected:slot_map_localized": 1
+  },
+  "path_status_counts": {
+    "collision_risk": 224,
+    "ready": 27
+  },
+  "map_frozen_scans": 13,
+  "maximum_map_icp_fallback_scans": 0,
+  "lease_required_scans": 10,
+  "lease_valid_scans": 14,
+  "lease_stop_scans": 0,
+  "park_completion_candidate_scans": 0,
+  "pose_lost_scans": 0,
+  "pose_bilateral_support_scans": 13,
+  "map_localized_scans": 2,
+  "map_depth_unobservable_scans": 0,
+  "direct_pair_axis_flip_count": 0,
+  "side_boundary_collision_scans": 216,
+  "recording_zip": "C:\\Users\\권희승\\PycharmProjects\\smartcar\\jayuljoohang\\data\\parking_sessions\\20260728_133729\\20260728_133729_replay.zip",
+  "video": "20260728_133729_dashboard.mp4",
+  "lidar_csv": "20260728_133729_lidar.csv",
+  "output_csv": "C:\\Users\\권희승\\PycharmProjects\\smartcar\\jayuljoohang\\.codex_tmp\\20260728_133729_curve_guard_replay.csv",
+  "camera_enabled": false,
+  "camera_interval_s": 0.5,
+  "position_tolerance_cm": 10.0,
+  "lidar_to_rear_axle_cm": -30.0,
+  "planner_implementation": "TParkingPlanner(shared_with_parking.py)",
+  "first_car_turn_target_cm": -65.0,
+  "prealign_speed": 100,
+  "prealign_steering": -120,
+  "prealign_timeout_s": 6.0,
+  "visual_replay": false,
+  "saved_video": null,
+  "limitations": [
+    "Camera and ultrasonic channels are diagnostics only; shared planner commands use LiDAR.",
+    "Virtual drive/steer commands cannot alter the prerecorded vehicle trajectory.",
+    "rear_lidar_cm is a diagnostic approximation and is not used by the shared planner."
+  ]
+}

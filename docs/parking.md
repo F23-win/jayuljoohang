@@ -5,9 +5,9 @@
 
 1. 라이다로 주차칸 양옆의 주차 차량 두 대를 찾는다.
 2. 두 차량 표면 사이 간격의 중심에 차량 후축을 맞춘다.
-3. 정차한 뒤 후방카메라 YOLO segmentation으로 ㄷ자 주차선 세 개를 찾는다.
-4. 주차칸 중심과 뒷선을 향하는 후진 경로를 만들고 추종한다.
-5. 카메라에서 계산한 뒷선 여유 거리에 도달하면 정지한다.
+3. 두 차량 사이에 공식 크기 `950 × 1500 mm`의 가상 주차칸을 만든다.
+4. 라이다 주차칸 중심과 가상 뒷선을 향하는 후진 경로를 만들고 추종한다.
+5. 차량이 가상 주차칸 안에 들어오고 뒷선 여유 거리에 도달하면 정지한다.
 
 대회 도면상 주차칸 크기는 `950 × 1500 mm`이다. 도로 폭 `850 mm`는 주차
 제어에 사용하지 않는다. 라이다는 페인트 선을 보는 센서가 아니므로,
@@ -53,7 +53,7 @@ CPU에서 mask가 불안정하면 `--imgsz 640 --frame-stride 1`로 되돌린다
 
 숫자 카메라 소스로 실행하면 녹화 재생과 동일한 `1280 × 720` 통합 화면 하나를
 표시한다. 왼쪽은 후방카메라와 YOLO mask, 오른쪽 위는 BEV, 오른쪽 아래는
-LiDAR이며 아래쪽에는 상태 머신·출력 명령·초음파 값이 표시된다. 화면에 표시한
+LiDAR이며 아래쪽에는 상태 머신·출력 명령·LiDAR 상태가 표시된다. 화면에 표시한
 동일 프레임은 별도 옵션 없이 자동으로 다음 경로에 저장된다.
 
 ```text
@@ -95,9 +95,20 @@ python3 scripts/parking.py \
   확장하지 않는다.
 - 빨강 사각형: 긴급 정지용 좁은 직후방 ROI
 - 파랑 사각형: 주차 차량 군집. 주황 공간의 양쪽 기준점이 된다.
-- 공간 확정 후 차량이 회전하면 처음 오른쪽에 있던 차량이 왼쪽 좌표로 넘어갈
-  수 있으므로 차량 군집 ROI는 좌우 `-1800~1800mm`를 사용한다. 공간 폭은
-  고정 y축 차이가 아니라 두 군집을 잇는 실제 방향의 거리로 계산한다.
+- 첫 차량을 2개 고유 scan에서 확인한 직후 차량 군집 ROI를
+  `xRight=-1800~2600mm`, `yBack=-2500~2500mm`로 고정 전환한다. 좌조향 중
+  처음 오른쪽에 있던 차량이 왼쪽 좌표로 넘어가도 좁은 초기 ROI로 돌아가지
+  않는다. `-1800mm`는 라이다 반경이 아니라 차량 좌표계의 왼쪽 경계이며,
+  라이다 원시 거리 상한은 별도로 `12000mm`이다.
+- 확장 ROI는 이미 확인한 첫 차량을 놓치지 않고 추적하는 용도다. 확장 ROI에
+  들어온 임의의 두 군집을 주차 차량으로 연결하지 않는다.
+- 좌조향 전진 중 첫 차량이 후축 기준 게이트를 지나면 두 번째 차량 검출을
+  ARM한다. 이후 `xRight=800~2600mm`, 후축 기준
+  `y=-700~500mm`인 우측 후방 게이트에 새로 들어온 군집만 두 번째 차량
+  후보로 사용한다. 이 후보와 추적 중인 첫 차량의 표면 간격이
+  `1100~1650mm`일 때 고유 scan 한 번으로 주차칸을 확정한다.
+- 검출된 표면 간격을 주차칸 폭으로 쓰지는 않고, 두 차량의 중심과 방향에
+  공식 크기 `950 × 1500mm` 박스를 만든다.
 - 최초 확정 뒤에는 같은 두 차량과 주차칸 깊이 방향을 추적한다. 중심과 각도는
   새 관측에 따라 계속 갱신하지만 이전 방향과 반대인 180도 후보 및 35도보다
   큰 단일 스캔 점프는 거부한다. 두 차량을 모두 놓친 동안에는 마지막 박스를
@@ -136,38 +147,88 @@ LiDAR 장착 위치는 기본적으로 뒤 범퍼보다 10cm 뒤, 뒤 차축보�
 ```text
 IDLE
   -> SEARCH_CARS
-  -> TRACK_GAP (첫 차량 감지 즉시 속도 10으로 감속)
+  -> TRACK_GAP (첫 차량을 추적하며 좌조향 시작 위치로 접근)
   -> PREALIGN_LEFT
-  -> VERIFY_PARKING_LINES
-  -> PLAN_REVERSE_PATH
-  -> FOLLOW_ENTRY_CURVE
+  -> VERIFY_SLOT_BOX (다음 고유 LiDAR scan 1회로 ARM)
+  -> SET_REVERSE_STEER (곡선 모드: 선택된 우조향을 정지 상태에서 설정)
+  -> FOLLOW_ENTRY_CURVE (곡선 모드: 선택된 우조향으로 후진)
+  -> RELEASE_ENTRY_STEER (정지 상태에서 조향 완화)
   -> FOLLOW_SLOT_CENTER
+  -> PARK_CONFIRM (footprint 완료 후보 scan에서 즉시 정지)
+  -> REACQUIRE_SLOT (최대 0.6초 동안 slot pose 복구)
+  -> FINISH_REVERSE_TIMED (후진 시작 후 복구 실패 시 저속 마무리)
   -> PARKED
+  -> EXIT_RIGHT
+  -> EXIT_DONE
 ```
+
+정상 주차 완료는 고정된 `950 x 1500 mm` slot-local frame에서 실측 차량
+폭·길이와 LiDAR-뒤범퍼 오프셋으로 차체 네 모서리를 계산해 판단한다. 다만 뒤쪽
+LiDAR가 주차칸 안에서 두 차량을 잃어 완료 판정 없이 멈추는 상황을 방지하기 위해,
+이미 후진을 시작한 뒤 pose 복구가 0.6초 안에 되지 않으면 ARM된 진입 조향을
+최대 0.3초만 유지하고 직선 저속 후진을 포함한 총 1.5초의
+`FINISH_REVERSE_TIMED`로 마무리한다. 정렬 후 직선 후진 2.5초가 끝났거나
+주차칸 뒤 여유에 도달한 경우에도 재탐색 대기 없이 `PARKED`로 확정한다.
 
 대회 조건상 첫 번째 주차 차량 바로 옆이 빈 주차칸으로 보장되므로 두 번째
 차량 검출을 기다리지 않는다. 첫 차량의 주차칸 인접 모서리를 2개 scan에서
 확인하고 그 모서리가 기본 `yBack=-65cm`에 도달하면 최대 좌조향을 시작한다.
 두 번째 차량은 좌조향 중에 주차칸 폭과 방향을 확정하는 데 사용한다.
+첫 차량은 확장 ROI에서 최근접 군집으로 계속 추적한다. 첫 차량이 우측 후방
+게이트를 지난 뒤에만 두 번째 차량 게이트를 ARM하므로, 차량 왼쪽에 있는
+사람이나 다른 군집은 두 번째 차량으로 사용할 수 없다.
 `POSITION_REAR_AXLE`은 선제 좌조향 기능을 끈 경우에만 사용하는 fallback이며,
 그 경우에도 오차 부호에 따라 한 방향으로 보정하고 목표에 들어오면 즉시
 다음 상태로 넘어가므로 앞뒤 왕복을 반복하지 않는다.
 
 `PREALIGN_LEFT`에서는 먼저 정지한 채 설정된 최대 좌조향까지 0.4초 동안
 조향한 뒤 저속으로 전진한다. 단순 타이머 회전이 아니라 매 LiDAR scan의
-주차칸 깊이 방향, 뒤축에서 입구 중심까지의 방향과 거리를 확인한다. 방향과
-위치가 연속 3회 허용 범위에 들어오면 바로 후진 준비로 넘어간다. 6초 안에
-정렬되지 않거나 목표 각도를 지나치면 즉시 정지하고 후방카메라로 만든 곡선
-경로를 따라 우회전 후진하는 fallback을 사용한다.
+주차칸 깊이 방향, 뒤축에서 입구 중심까지의 방향과 거리를 확인한다. 충돌
+없는 경로 후보가 한 번 나오면 즉시 정지하고 `VERIFY_SLOT_BOX`로 넘어간다.
+여기서는 중복 loop를 세지 않고 다음 고유 LiDAR scan 한 번에서 경로를 ARM한다.
+각도는 직접 후진과 곡선 후진 중 어느 모드를 사용할지만 선택하며 ARM 자체를
+막지 않는다. 단, 전체 차체가 주차칸 입구부터 최종 정지 위치까지 통과할 수
+있는 경로만 ARM한다. `VERIFY_SLOT_BOX`에서 이 검사가 실패하면 정지 상태로
+끝내거나 `REACQUIRE_SLOT`을 반복하지 않고, 한 제어 주기 정지 후
+`PREALIGN_LEFT`/`PROVISIONAL_PREALIGN` 전진을 재개한다.
+곡선 후진은 `SET_REVERSE_STEER`에 진입했다는 사실만으로 시작하지 않는다.
+`VERIFY_SLOT_BOX`에서 생성한 READY 경로와 선택 조향이 함께 ARM된 경우에만
+후진 명령을 낸다. 조향 설정 전 또는 설정 중 slot pose가 소실되면 기존 ARM을
+폐기하고, 정지 상태에서 pose를 다시 찾은 뒤 `VERIFY_SLOT_BOX`의 새 고유
+scan으로 경로를 다시 ARM한다.
+
+곡선 모드는 설정된 150/135/120/105/90 조향 후보에 대응하는 곡률을 모두
+검사하고 가장 중앙에 안전하게 끝나는 후보를 고른다. 선택한 조향은 0.4초
+정착 중 새 scan의 작은 흔들림으로 바꾸지 않는다. 최소 곡선 주행 시간이 지난
+뒤 주차칸과의 각도 오차가 12도 이내인 고유 scan 한 번에서 조향 완화를
+시작한다. 조향 완화 중에는 차를 세워 차체가 검사하지 않은 곡선을 그리지
+않게 하고, 바퀴가 풀린 뒤 주차칸 중심 방향 후진을 재개한다.
+
+사전정렬 중에는 아직 map을 잠그지 않고 매 scan에서 확인된 두 차량으로 동적
+박스를 만든다. 안전 경로 후보가 나온 뒤 `VERIFY_SLOT_BOX`에서 정지한 다음
+고유 scan의 `DIRECT_PAIR` pose로 처음 map을 freeze한다. 이후 raw pair가 다시
+관측되어도 map의 source scan과 local 좌표는 바뀌지 않는다. map 정합이 정상일
+때 direct-pair 차이가 이동 80mm·회전 5도 이내이면 차이의 25%만 보정하고, 큰
+점프는 거부한다. 반대로 map 정합 자체가 실패한 경우에는 멈추지 않고 scan당
+최대 80mm·5도만 direct-pair 방향으로 따라가는 `DIRECT_PAIR_RECOVERY`를
+사용한다. 검증에 실패해 사전정렬로 돌아가면 승인되지 않은 map은 버리고 다음
+검증에서 현재 두 차량으로 새 map을 만든다.
+
+주차 시작 225초에는 소프트 데드라인을 적용한다. 이미 경로가 ARM됐거나 후진을
+시작했다면 시간 기반 마무리로 전환하며, 기본 1.5초 마무리·3초 주차 유지·1.6초
+출차 회전을 포함해 240초 전에 `EXIT_DONE`에 도달하도록 예산을 잡는다. LiDAR
+통신 단절 또는 실제 안전 ROI 장애물은 이 완주용 fallback보다 우선하며 기존처럼
+즉시 오류 정지한다.
 
 녹화 영상은 이미 정해진 차량 움직임을 바꿀 수 없으므로 명령의 상태 전이와
 가상 속도/조향만 검증할 수 있다. 실제 차량에서는 아래 값을 바퀴를 띄운
 상태와 넓은 빈 공간에서 먼저 보정한다.
 
-- `--prealign-speed`: 좌회전 전진 구간 속도. 기본값 35
-- `--prealign-steering`: 선회 준비 전용 좌회전 명령. 기본값 -150. 후진 경로
-  추종 상한 `max_steering=110`과는 독립적이다.
-- `--prealign-timeout-s`: 정렬 실패 후 camera-curve fallback까지 시간. 기본값 6초
+- `--prealign-speed`: 선제·일반 좌회전 전진 구간을 함께 덮어쓴다. 현재 JSON의
+  선제 사전정렬 속도는 35이다.
+- `--prealign-steering`: 선회 준비 전용 좌회전 명령. 기본값 -120. 후진 경로
+  추종 상한 `max_steering=150`과는 독립적이다.
+- `--prealign-timeout-s`: 정렬 실패 후 LiDAR 곡선 경로 전환을 검토할 시간. 기본값 6초
 - `--first-car-turn-target-cm`: 첫 차량 모서리의 좌조향 시작 좌표. 기본값 -65cm
 
 `scripts/arduino_parking_replay.py`는 더 이상 별도의 Python 상태 머신으로
@@ -176,24 +237,33 @@ IDLE
 `steer_deg`, `event`는 실시간 실행에서 생성될 값과 동일하다. 단, 녹화된
 차량 궤적은 가상 명령에 반응하지 않으므로 상태가 timeout으로 끝날 수 있다.
 
-실시간 시리얼 연결에서는 `parking.py`가 아두이노에 `USON`을 보내 측면 초음파
-`SL/SR`을 약 220ms 주기로 받는다. 0mm는 echo 측정 실패로 보고 사용하지
-않으며, 마지막 측정이 0.8초보다 오래되면 폐기한다. 후진 중에는
-`0.23 steering/mm * (right-left)` P보정을 최대 ±35까지 카메라 경로 조향에
-더한다. 유효한 어느 한쪽 거리가 100mm 이하이면 `EMERGENCY_STOP`을 latch한다.
-초음파 측정이 다시 정상이어도 자동 재출발하지 않으며 운전자가 `R`로 원인을
-확인하고 다시 시작해야 한다.
+주차 런타임은 초음파 스트림을 켜거나 측정값을 읽지 않으며, 탐지·조향·정지
+판단에는 라이다만 사용한다. 최초 정상 라이다 scan 전에는 정지 상태로
+기다린다. 정상 scan을 한 번 받은 뒤 라이다가 끊기거나 stale/error 상태가
+되면 즉시 `EMERGENCY_STOP` 명령을 보내고 런타임을 오류 코드로 종료한다.
 
-후축이 목표를 지나친 경우, 라이다나 카메라가 사라진 경우, 경로 곡률이
-한계를 넘는 경우에는 움직이지 않는다. 후진 중 빨강 안전 ROI에 물체가
-들어오면 `EMERGENCY_STOP`이 걸리고 운전자 reset 전까지 해제되지 않는다.
+후진 중 빨강 안전 ROI에 물체가 들어오면 `EMERGENCY_STOP`이 걸리고 운전자
+reset 전까지 해제되지 않는다.
 
 ## 후진 경로
 
-BEV에서 현재 후축 위치, 뒷선 앞 정지 목표, 주차선 방향을 이용해 3차
-베지어 곡선을 만든다. 시작 접선은 차량의 직후방, 끝 접선은 양옆 주차선의
-중심 방향이다. 매 프레임 경로를 다시 만들고 look-ahead 곡률을 조향값으로
-변환하므로 mask 위치 변화에 따라 경로가 갱신된다.
+BEV에서 현재 후축 위치, 가상 뒷선 앞 정지 목표, 라이다 주차칸 방향을 이용해
+`일정 곡률 원호 + 주차칸 방향 직선`의 전체 경로를 만든다. 각 조향 후보마다
+실측 `600 × 1000mm` 차체 외곽을 8px 이하 간격으로 경로 전체에 배치해 양옆
+차량 경계와 가상 뒷선을 넘는지 검사한다. 최종 차체 앞쪽이 주차칸 안으로
+20px 이상 들어오고, 측면 최소 여유가 8px 이상인 후보만 `READY`다. 따라서
+차체가 아직 입구 앞에만 있는 짧은 원호는 더 이상 `READY`가 될 수 없다.
+
+`entry_steering_ratio_candidates`는 기본
+`[1.0, 0.9, 0.8, 0.7, 0.6]`이며 `max_steering=150`일 때
+150/135/120/105/90 명령에 해당한다. 실제 명령과 회전 반경의 관계는
+`maximum_curvature_per_px`와 `full_steering_curvature_per_px`로 보정한다.
+다음 실험에서는 조향 후보 목록보다 이 곡률 보정이 먼저 맞는지 확인해야 한다.
+
+세션 CSV에는 선택 비율, 예상 회전 각도, 최종 횡오차, 최소 측면 여유,
+최대 진입 깊이가 각각 `path_entry_steering_ratio`,
+`path_entry_heading_change_deg`, `path_final_lateral_offset_px`,
+`path_minimum_side_clearance_px`, `path_maximum_entry_depth_px`로 저장된다.
 
 ## 현재 녹화 라이다 검증 결과
 
@@ -281,7 +351,62 @@ Apple Silicon에서는 `--device auto`가 MPS를 선택한다. 모터 출력은 
   --serial-port COM6
 ```
 
-macOS 실차 실행 예시는 다음과 같다. `--prealign-steering -150`은 현재
+### 실차 분석 세션 저장
+
+라이브 실행은 기본값 `--record-session auto`에 의해 다음 파일을
+`data/parking_sessions/<실행시각>/`에 함께 저장한다.
+
+- `*_dashboard.mp4`: 실제 표시된 카메라·BEV·LiDAR·상태 화면
+- `*_lidar.csv`: 원본 LiDAR 스캔(`timestamp, quality, angle, distance`)
+- `*_telemetry.csv`: 상태, 계획/실제 명령, 슬롯 pose, path 판정,
+  motion lease, 주차 완료 판정
+- `*_metadata.json`: 적용 설정, 실행 옵션, 종료 상태와 데이터 개수
+- `*_replay.zip`: 위 MP4와 LiDAR CSV를 바로 replay할 수 있는 묶음
+
+초음파는 판단에도 저장에도 사용하지 않는다. 정상 종료뿐 아니라 `Q`,
+`Esc`, 창 닫기 또는 LiDAR 오류로 종료할 때도 지금까지 받은 CSV와
+메타데이터를 닫아 보존한다. replay ZIP은 대시보드 영상과 LiDAR 스캔이
+둘 다 존재할 때 생성된다. 아래 명령의 `--record-camera`는 카메라 영상을
+대시보드에 함께 저장하기만 한다. `--no-camera`이므로 YOLO는 로드하지
+않고 주차 판단과 차량 명령은 계속 LiDAR만 사용한다.
+
+Windows에서 포트를 확인한다.
+
+```powershell
+python scripts/list_serial_ports.py
+```
+
+먼저 모터 출력을 끈 상태로 LiDAR와 기록을 확인한다.
+
+```powershell
+python scripts/parking.py `
+  --source 1 `
+  --no-camera `
+  --record-camera `
+  --lidar-port COM5 `
+  --record-session on `
+  --record-dashboard on
+```
+
+그다음 바퀴 방향과 정지 동작을 확인한 뒤 실차 주차를 실행한다.
+
+```powershell
+python scripts/parking.py `
+  --source 1 `
+  --no-camera `
+  --record-camera `
+  --lidar-port COM5 `
+  --serial `
+  --serial-port COM6 `
+  --record-session on `
+  --record-dashboard on
+```
+
+화면이 열린 뒤 `Space`로 미션을 시작한다. 이상이 있으면 `R`로 즉시
+정지·초기화하고, `Q` 또는 `Esc`로 종료한다. COM 번호는 당일
+`list_serial_ports.py` 출력에 맞게 바꾼다.
+
+macOS 실차 실행 예시는 다음과 같다. `--prealign-steering -120`은 현재
 `vehicle_controller.ino`의 좌측 끝 pot 보정값으로 이동하므로, 먼저 바퀴를
 띄운 상태에서 실제 기구 끝과 일치하는지 확인한다.
 
@@ -294,6 +419,6 @@ python3 scripts/parking.py \
   --serial \
   --serial-port /dev/cu.usbmodem-ARDUINO \
   --prealign-speed 35 \
-  --prealign-steering -150 \
+  --prealign-steering -120 \
   --prealign-timeout-s 6
 ```

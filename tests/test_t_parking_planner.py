@@ -1,9 +1,14 @@
 import unittest
 import math
+from dataclasses import replace
 
 from skku_autocar.estimation.parking_geometry import ParkingGeometry
 from skku_autocar.estimation.parking_lidar import LidarParkingObservation
-from skku_autocar.planning.reverse_parking_path import ReversePath, ReversePathConfig
+from skku_autocar.planning.reverse_parking_path import (
+    ReversePath,
+    ReversePathConfig,
+    ReversePathStatus,
+)
 from skku_autocar.planning.t_parking_planner import (
     ParkingPlannerConfig,
     ParkingState,
@@ -17,6 +22,7 @@ def geometry(
     remaining=100.0,
     reason="parking_bay",
     fully_inside=True,
+    completion_candidate=False,
 ):
     return ParkingGeometry(
         found=True,
@@ -32,6 +38,18 @@ def geometry(
         stop_target_x_px=300.0 + 125.0 * lateral,
         stop_target_y_px=100.0,
         vehicle_fully_inside=fully_inside,
+        vehicle_footprint_slot_local_mm=(
+            (-300.0, 100.0),
+            (300.0, 100.0),
+            (300.0, 1100.0),
+            (-300.0, 1100.0),
+        ),
+        park_completion_candidate=completion_candidate,
+        park_completion_reason=(
+            "footprint_inside_fixed_slot"
+            if completion_candidate
+            else "footprint_crosses_slot_entrance"
+        ),
         confidence=0.9,
         reason=reason,
     )
@@ -42,9 +60,12 @@ def lidar_gap(
     reached=False,
     unsafe=False,
     pair_observed=False,
+    is_new_scan=True,
+    scan_timestamp=1.0,
 ):
     return LidarParkingObservation(
-        timestamp=1.0,
+        timestamp=scan_timestamp,
+        is_new_scan=is_new_scan,
         valid=True,
         unsafe=unsafe,
         observed_points=20,
@@ -63,12 +84,18 @@ def lidar_gap(
     )
 
 
-def prealign_lidar(slot_heading_deg=90.0, entry_bearing_deg=90.0, distance_mm=1000.0):
+def prealign_lidar(
+    slot_heading_deg=90.0,
+    entry_bearing_deg=90.0,
+    distance_mm=1000.0,
+    is_new_scan=True,
+):
     slot_angle = math.radians(slot_heading_deg)
     bearing = math.radians(entry_bearing_deg)
     rear_axle_y = -300.0
     return LidarParkingObservation(
         timestamp=1.0,
+        is_new_scan=is_new_scan,
         valid=True,
         observed_points=20,
         car_count=2,
@@ -106,16 +133,11 @@ class TParkingPlannerTest(unittest.TestCase):
             ParkingPlannerConfig(
                 prealign_enabled=False,
                 start_forward_s=0.0,
-                verify_hold_s=0.0,
                 aligned_confirm_frames=1,
                 search_timeout_s=100.0,
                 gap_tracking_timeout_s=100.0,
                 position_timeout_s=100.0,
-                verify_timeout_s=100.0,
-                path_timeout_s=100.0,
-                path_confirm_frames=1,
                 reverse_entry_steer_settle_s=0.0,
-                reverse_entry_release_confirm_frames=1,
                 entry_curve_timeout_s=100.0,
                 center_follow_timeout_s=100.0,
                 exit_straight_s=3.0,
@@ -128,16 +150,13 @@ class TParkingPlannerTest(unittest.TestCase):
             ParkingPlannerConfig(
                 prealign_enabled=True,
                 start_forward_s=0.0,
-                first_car_straight_s=0.0,
+                provisional_prealign_speed=8,
                 prealign_speed=14,
                 prealign_steering=-150,
                 prealign_steer_settle_s=0.0,
                 prealign_timeout_s=2.0,
-                prealign_confirm_frames=2,
-                verify_hold_s=0.0,
                 search_timeout_s=100.0,
                 position_timeout_s=100.0,
-                verify_timeout_s=100.0,
             )
         )
 
@@ -146,7 +165,6 @@ class TParkingPlannerTest(unittest.TestCase):
             ParkingPlannerConfig(
                 prealign_enabled=False,
                 start_forward_s=0.0,
-                verify_hold_s=0.0,
                 aligned_confirm_frames=1,
                 correction_enabled=True,
                 correction_steer_settle_s=0.0,
@@ -161,11 +179,7 @@ class TParkingPlannerTest(unittest.TestCase):
                 search_timeout_s=100.0,
                 gap_tracking_timeout_s=100.0,
                 position_timeout_s=100.0,
-                verify_timeout_s=100.0,
-                path_timeout_s=100.0,
-                path_confirm_frames=1,
                 reverse_entry_steer_settle_s=0.0,
-                reverse_entry_release_confirm_frames=1,
                 entry_curve_timeout_s=100.0,
                 center_follow_timeout_s=100.0,
             ),
@@ -218,50 +232,85 @@ class TParkingPlannerTest(unittest.TestCase):
             lidar_gap(0.0, reached=True),
             0.5,
         )
-        parked = planner.update(
-            geometry(heading=0.0, lateral=0.0, remaining=0.0),
-            lidar_gap(0.0, reached=True),
+        candidate = planner.update(
+            geometry(
+                heading=0.0,
+                lateral=0.0,
+                remaining=0.0,
+                completion_candidate=True,
+            ),
+            lidar_gap(0.0, reached=True, scan_timestamp=1.0),
             0.6,
         )
+        parked = planner.update(
+            geometry(
+                heading=0.0,
+                lateral=0.0,
+                remaining=0.0,
+                completion_candidate=True,
+            ),
+            lidar_gap(0.0, reached=True, scan_timestamp=2.0),
+            0.7,
+        )
         hold = planner.update(
-            geometry(heading=0.0, lateral=0.0, remaining=0.0),
-            lidar_gap(0.0, reached=True),
+            geometry(
+                heading=0.0,
+                lateral=0.0,
+                remaining=0.0,
+                completion_candidate=True,
+            ),
+            lidar_gap(0.0, reached=True, scan_timestamp=3.0),
             3.5,
-            right_ultrasonic_mm=500.0,
         )
         exit_right = planner.update(
             geometry(heading=0.0, lateral=0.0, remaining=0.0),
             lidar_gap(0.0, reached=True),
             3.7,
-            right_ultrasonic_mm=500.0,
         )
         exit_straight = planner.update(
             geometry(heading=0.0, lateral=0.0, remaining=0.0),
             lidar_gap(0.0, reached=True),
             5.4,
-            right_ultrasonic_mm=500.0,
         )
         exit_done = planner.update(
             geometry(heading=0.0, lateral=0.0, remaining=0.0),
             lidar_gap(0.0, reached=True),
             8.5,
-            right_ultrasonic_mm=500.0,
         )
 
         self.assertEqual(tracking.state, ParkingState.TRACK_GAP)
         self.assertEqual(positioned.state, ParkingState.POSITION_REAR_AXLE)
         self.assertEqual(verifying.state, ParkingState.VERIFY_SLOT_BOX)
-        self.assertEqual(path_plan.state, ParkingState.PLAN_REVERSE_PATH)
+        self.assertEqual(path_plan.state, ParkingState.SET_REVERSE_STEER)
+        self.assertEqual(
+            path_plan.reason,
+            "reverse_path_armed:curve:set_candidate_steer",
+        )
+        self.assertEqual(path_plan.command.speed, 0)
+        self.assertEqual(
+            path_plan.command.steering,
+            planner.config.max_steering,
+        )
         self.assertEqual(armed.state, ParkingState.FOLLOW_ENTRY_CURVE)
         self.assertIsNotNone(armed.path)
-        self.assertEqual(aligned.state, ParkingState.FOLLOW_SLOT_CENTER)
+        self.assertEqual(aligned.state, ParkingState.FOLLOW_ENTRY_CURVE)
         self.assertLess(aligned.command.speed, 0)
-        self.assertEqual(aligned.command.steering, 0)
+        self.assertEqual(
+            aligned.command.steering,
+            planner.config.max_steering,
+        )
         self.assertEqual(
             aligned.reason,
-            "following_slot_center:entry_heading_released",
+            "following_entry_curve:candidate_steer",
         )
+        self.assertEqual(candidate.state, ParkingState.PARK_CONFIRM)
+        self.assertEqual(candidate.command.speed, 0)
+        self.assertTrue(candidate.command.brake)
         self.assertEqual(parked.state, ParkingState.PARKED)
+        self.assertEqual(
+            parked.reason,
+            "park_confirmed_on_first_stopped_scan",
+        )
         self.assertTrue(parked.command.brake)
         self.assertEqual(hold.state, ParkingState.PARKED)
         self.assertEqual(hold.reason, "parked_hold")
@@ -275,19 +324,121 @@ class TParkingPlannerTest(unittest.TestCase):
         self.assertEqual(exit_done.state, ParkingState.EXIT_DONE)
         self.assertTrue(exit_done.command.brake)
 
-    def test_reverse_path_must_be_confirmed_before_reverse_entry(self):
+    def test_park_confirm_ignores_candidate_scan_duplicate(self):
+        planner = self.make_planner()
+        self.arm_reverse(planner)
+        complete = geometry(
+            heading=0.0,
+            lateral=0.0,
+            remaining=20.0,
+            completion_candidate=True,
+        )
+
+        candidate = planner.update(
+            complete,
+            lidar_gap(
+                0.0,
+                reached=True,
+                scan_timestamp=10.0,
+            ),
+            0.5,
+        )
+        duplicate = planner.update(
+            complete,
+            lidar_gap(
+                0.0,
+                reached=True,
+                scan_timestamp=10.0,
+            ),
+            0.6,
+        )
+        confirmed = planner.update(
+            complete,
+            lidar_gap(
+                0.0,
+                reached=True,
+                scan_timestamp=11.0,
+            ),
+            0.7,
+        )
+
+        self.assertEqual(candidate.state, ParkingState.PARK_CONFIRM)
+        self.assertTrue(candidate.command.brake)
+        self.assertEqual(duplicate.state, ParkingState.PARK_CONFIRM)
+        self.assertEqual(
+            duplicate.reason,
+            "park_confirm_waiting_for_first_stopped_scan",
+        )
+        self.assertEqual(confirmed.state, ParkingState.PARKED)
+
+    def test_failed_first_park_confirm_scan_reacquires_before_resume(self):
+        planner = self.make_planner()
+        self.arm_reverse(planner)
+        candidate = geometry(
+            heading=0.0,
+            lateral=0.0,
+            remaining=20.0,
+            completion_candidate=True,
+        )
+        planner.update(
+            candidate,
+            lidar_gap(
+                0.0,
+                reached=True,
+                scan_timestamp=10.0,
+            ),
+            0.5,
+        )
+
+        lost = planner.update(
+            ParkingGeometry(reason="slot_map_depth_unobservable"),
+            lidar_gap(
+                0.0,
+                reached=True,
+                scan_timestamp=11.0,
+            ),
+            0.6,
+        )
+        reacquired = planner.update(
+            geometry(
+                heading=2.0,
+                lateral=0.05,
+                remaining=60.0,
+                completion_candidate=False,
+            ),
+            lidar_gap(
+                0.0,
+                reached=True,
+                scan_timestamp=12.0,
+            ),
+            0.7,
+        )
+
+        self.assertEqual(lost.state, ParkingState.REACQUIRE_SLOT)
+        self.assertTrue(lost.command.brake)
+        self.assertEqual(
+            lost.reason,
+            "park_confirm_slot_unavailable:reacquire",
+        )
+        self.assertEqual(
+            reacquired.state,
+            ParkingState.VERIFY_SLOT_BOX,
+        )
+        self.assertTrue(reacquired.command.brake)
+        self.assertEqual(
+            reacquired.reason,
+            "slot_reacquired:resume_pending:verify_slot_box",
+        )
+
+    def test_verify_arms_first_unique_scan_without_plan_state(self):
         planner = TParkingPlanner(
             ParkingPlannerConfig(
                 prealign_enabled=False,
                 start_forward_s=0.0,
-                verify_hold_s=0.0,
                 aligned_confirm_frames=1,
                 search_timeout_s=100.0,
                 gap_tracking_timeout_s=100.0,
                 position_timeout_s=100.0,
-                verify_timeout_s=100.0,
-                path_timeout_s=100.0,
-                path_confirm_frames=3,
                 entry_curve_timeout_s=100.0,
                 center_follow_timeout_s=100.0,
             ),
@@ -297,31 +448,66 @@ class TParkingPlannerTest(unittest.TestCase):
         planner.update(geometry(), lidar_gap(), 0.0)
         planner.update(geometry(), lidar_gap(), 0.1)
         planner.update(geometry(), lidar_gap(0.0, reached=True), 0.2)
-        planner.update(geometry(), lidar_gap(0.0, reached=True), 0.3)
 
-        first = planner.update(geometry(), lidar_gap(0.0, reached=True), 0.4)
-        second = planner.update(geometry(), lidar_gap(0.0, reached=True), 0.5)
-        armed = planner.update(geometry(), lidar_gap(0.0, reached=True), 0.6)
+        duplicate = planner.update(
+            geometry(),
+            lidar_gap(0.0, reached=True, is_new_scan=False),
+            0.3,
+        )
+        armed = planner.update(
+            geometry(),
+            lidar_gap(0.0, reached=True, is_new_scan=True),
+            0.4,
+        )
 
-        self.assertEqual(first.state, ParkingState.PLAN_REVERSE_PATH)
-        self.assertEqual(first.reason, "reverse_path_confirming:1/3")
-        self.assertIsNotNone(first.path)
-        self.assertEqual(second.reason, "reverse_path_confirming:2/3")
-        self.assertEqual(armed.state, ParkingState.FOLLOW_ENTRY_CURVE)
-        self.assertEqual(armed.reason, "reverse_path_armed")
+        self.assertEqual(duplicate.state, ParkingState.VERIFY_SLOT_BOX)
+        self.assertEqual(
+            duplicate.reason,
+            "waiting_for_unique_lidar_arm_scan",
+        )
+        self.assertEqual(armed.state, ParkingState.SET_REVERSE_STEER)
+        self.assertEqual(
+            armed.reason,
+            "reverse_path_armed:curve:set_candidate_steer",
+        )
+        self.assertIsNotNone(armed.path)
+        self.assertEqual(armed.command.speed, 0)
+        self.assertEqual(armed.command.steering, planner.config.max_steering)
 
-    def test_reverse_path_confirm_counter_tolerates_brief_path_loss(self):
+    def test_failed_pre_reverse_check_resumes_forward_prealign(self):
+        planner = self.make_prealign_planner()
+        self.enter_prealign(planner)
+        slot = geometry()
+        lidar = prealign_lidar(
+            slot_heading_deg=70.0,
+            entry_bearing_deg=65.0,
+            distance_mm=1500.0,
+        )
+
+        verifying = planner.update(slot, lidar, 0.2)
+        unarmable = replace(slot, stop_target_y_px=700.0)
+        resumed = planner.update(unarmable, lidar, 0.3)
+        moving = planner.update(unarmable, lidar, 0.4)
+
+        self.assertEqual(verifying.state, ParkingState.VERIFY_SLOT_BOX)
+        self.assertEqual(resumed.state, ParkingState.PREALIGN_LEFT)
+        self.assertTrue(resumed.command.brake)
+        self.assertIn("resume_prealign_left", resumed.reason)
+        self.assertEqual(moving.state, ParkingState.PREALIGN_LEFT)
+        self.assertGreater(moving.command.speed, 0)
+        self.assertEqual(
+            moving.command.steering,
+            planner.config.prealign_steering,
+        )
+
+    def test_verify_reacquires_after_failed_unique_scan_then_arms(self):
         planner = TParkingPlanner(
             ParkingPlannerConfig(
                 prealign_enabled=False,
                 start_forward_s=0.0,
-                verify_hold_s=0.0,
                 search_timeout_s=100.0,
                 gap_tracking_timeout_s=100.0,
                 position_timeout_s=100.0,
-                verify_timeout_s=100.0,
-                path_timeout_s=100.0,
-                path_confirm_frames=3,
             ),
             ReversePathConfig(maximum_curvature_per_px=0.05),
         )
@@ -330,59 +516,411 @@ class TParkingPlannerTest(unittest.TestCase):
         planner.update(geometry(), lidar_gap(), 0.0)
         planner.update(geometry(), lidar_gap(), 0.1)
         planner.update(geometry(), lidar_gap(0.0, reached=True), 0.2)
-        planner.update(geometry(), lidar_gap(0.0, reached=True), 0.3)
 
-        first = planner.update(geometry(), lidar_gap(0.0, reached=True), 0.4)
-        second = planner.update(geometry(), lidar_gap(0.0, reached=True), 0.5)
-        lost = planner.update(missing_geometry, lidar_gap(0.0, reached=True), 0.6)
-        recovered = planner.update(geometry(), lidar_gap(0.0, reached=True), 0.7)
-        armed = planner.update(geometry(), lidar_gap(0.0, reached=True), 0.8)
-
-        self.assertEqual(first.reason, "reverse_path_confirming:1/3")
-        self.assertEqual(second.reason, "reverse_path_confirming:2/3")
-        self.assertIn("confirm=1/3", lost.reason)
-        self.assertEqual(recovered.reason, "reverse_path_confirming:2/3")
-        self.assertEqual(armed.state, ParkingState.FOLLOW_ENTRY_CURVE)
-
-    def test_side_ultrasonic_is_ignored_during_exit(self):
-        planner = self.make_planner()
-        planner.start(0.0)
-        one_car = LidarParkingObservation(
-            timestamp=0.0,
-            valid=True,
-            observed_points=10,
-            car_count=1,
-            first_car_seen=True,
-            first_car_confirmed=True,
-            reason="one_parked_car",
+        lost = planner.update(
+            missing_geometry,
+            lidar_gap(0.0, reached=True),
+            0.3,
         )
-
-        planner.update(geometry(), one_car, 0.0)
-        planner.update(geometry(), lidar_gap(), 0.1)
-        planner.update(geometry(), lidar_gap(0.0, reached=True), 0.2)
-        planner.update(geometry(), lidar_gap(0.0, reached=True), 0.3)
-        planner.update(geometry(), lidar_gap(0.0, reached=True), 0.4)
-        planner.update(
-            geometry(heading=0.0, lateral=0.0),
+        duplicate = planner.update(
+            geometry(),
+            lidar_gap(0.0, reached=True, is_new_scan=False),
+            0.4,
+        )
+        armed = planner.update(
+            geometry(),
             lidar_gap(0.0, reached=True),
             0.5,
         )
-        planner.update(
-            geometry(heading=0.0, lateral=0.0, remaining=0.0),
+        verified = planner.update(
+            geometry(),
             lidar_gap(0.0, reached=True),
             0.6,
         )
 
-        moving = planner.update(
-            geometry(heading=0.0, lateral=0.0, remaining=0.0),
-            lidar_gap(0.0, reached=True),
-            3.7,
-            right_ultrasonic_mm=95.0,
+        self.assertEqual(lost.state, ParkingState.REACQUIRE_SLOT)
+        self.assertEqual(lost.reason, "slot_arm_geometry_unavailable")
+        self.assertEqual(
+            duplicate.reason,
+            "reacquire_waiting_for_unique_lidar_scan",
+        )
+        self.assertEqual(armed.state, ParkingState.VERIFY_SLOT_BOX)
+        self.assertEqual(
+            armed.reason,
+            "slot_reacquired:resume_pending:verify_slot_box",
+        )
+        self.assertEqual(verified.state, ParkingState.SET_REVERSE_STEER)
+        self.assertEqual(
+            verified.reason,
+            "reverse_path_armed:curve:set_candidate_steer",
         )
 
-        self.assertEqual(moving.state, ParkingState.EXIT_RIGHT)
-        self.assertFalse(moving.command.brake)
-        self.assertEqual(moving.command.steering, planner.config.exit_turn_steering)
+    def test_set_reverse_steer_without_arm_returns_to_verify_stopped(self):
+        planner = self.make_planner()
+        planner.start(0.0)
+        planner.update(geometry(), lidar_gap(), 0.0)
+        planner.state = ParkingState.SET_REVERSE_STEER
+        planner._state_started_at = 0.0
+
+        guarded = planner.update(
+            geometry(),
+            lidar_gap(0.0, reached=True),
+            0.5,
+        )
+
+        self.assertEqual(guarded.state, ParkingState.VERIFY_SLOT_BOX)
+        self.assertTrue(guarded.command.brake)
+        self.assertEqual(guarded.command.speed, 0)
+        self.assertEqual(guarded.command.steering, 0)
+        self.assertEqual(
+            guarded.reason,
+            "reverse_entry_not_armed:return_verify",
+        )
+
+    def test_pose_loss_while_setting_reverse_steer_requires_new_verify_arm(self):
+        planner = TParkingPlanner(
+            ParkingPlannerConfig(
+                prealign_enabled=False,
+                start_forward_s=0.0,
+                search_timeout_s=100.0,
+                gap_tracking_timeout_s=100.0,
+                position_timeout_s=100.0,
+            ),
+            ReversePathConfig(maximum_curvature_per_px=0.05),
+        )
+        missing_geometry = ParkingGeometry(
+            reason="lidar_slot_box_unavailable"
+        )
+        planner.start(0.0)
+        planner.update(geometry(), lidar_gap(), 0.0)
+        planner.update(geometry(), lidar_gap(), 0.1)
+        planner.update(geometry(), lidar_gap(0.0, reached=True), 0.2)
+        armed = planner.update(
+            geometry(),
+            lidar_gap(0.0, reached=True),
+            0.3,
+        )
+
+        lost = planner.update(
+            missing_geometry,
+            lidar_gap(0.0, reached=True),
+            0.4,
+        )
+        reacquired = planner.update(
+            geometry(),
+            lidar_gap(0.0, reached=True),
+            0.5,
+        )
+        rearmed = planner.update(
+            geometry(),
+            lidar_gap(0.0, reached=True),
+            0.6,
+        )
+
+        self.assertEqual(armed.state, ParkingState.SET_REVERSE_STEER)
+        self.assertEqual(lost.state, ParkingState.REACQUIRE_SLOT)
+        self.assertTrue(lost.command.brake)
+        self.assertEqual(reacquired.state, ParkingState.VERIFY_SLOT_BOX)
+        self.assertEqual(
+            reacquired.reason,
+            "slot_reacquired:resume_pending:verify_slot_box",
+        )
+        self.assertEqual(rearmed.state, ParkingState.SET_REVERSE_STEER)
+        self.assertEqual(
+            rearmed.reason,
+            "reverse_path_armed:curve:set_candidate_steer",
+        )
+
+    def test_pose_loss_during_reverse_requires_new_verify_arm(self):
+        planner = self.make_planner()
+        self.arm_reverse(planner)
+        missing_geometry = ParkingGeometry(
+            reason="slot_map_depth_unobservable"
+        )
+
+        lost = planner.update(
+            missing_geometry,
+            lidar_gap(0.0, reached=True),
+            0.5,
+        )
+        reacquired = planner.update(
+            geometry(),
+            lidar_gap(0.0, reached=True),
+            0.6,
+        )
+        rearmed = planner.update(
+            geometry(),
+            lidar_gap(0.0, reached=True),
+            0.7,
+        )
+
+        self.assertEqual(lost.state, ParkingState.REACQUIRE_SLOT)
+        self.assertTrue(lost.command.brake)
+        self.assertEqual(
+            lost.reason,
+            "slot_pose_unavailable_during_reverse",
+        )
+        self.assertEqual(reacquired.state, ParkingState.VERIFY_SLOT_BOX)
+        self.assertEqual(
+            reacquired.reason,
+            "slot_reacquired:resume_pending:verify_slot_box",
+        )
+        self.assertEqual(rearmed.state, ParkingState.SET_REVERSE_STEER)
+        self.assertEqual(
+            rearmed.reason,
+            "reverse_path_armed:curve:set_candidate_steer",
+        )
+
+    def test_reacquire_timeout_after_reverse_uses_timed_finish(self):
+        planner = TParkingPlanner(
+            ParkingPlannerConfig(
+                prealign_enabled=False,
+                start_forward_s=0.0,
+                reverse_entry_steer_settle_s=0.0,
+                slot_reacquire_timeout_s=0.2,
+                recovery_finish_reverse_speed=-40,
+                recovery_finish_curve_s=0.1,
+                recovery_finish_total_s=0.4,
+                search_timeout_s=100.0,
+                gap_tracking_timeout_s=100.0,
+                position_timeout_s=100.0,
+            ),
+            ReversePathConfig(maximum_curvature_per_px=0.05),
+        )
+        self.arm_reverse(planner)
+        lost_geometry = ParkingGeometry(
+            reason="slot_map_depth_unobservable"
+        )
+
+        lost = planner.update(
+            lost_geometry,
+            lidar_gap(0.0, reached=True),
+            0.5,
+        )
+        fallback = planner.update(
+            lost_geometry,
+            lidar_gap(0.0, reached=True),
+            0.8,
+        )
+        still_reversing = planner.update(
+            lost_geometry,
+            lidar_gap(0.0, reached=True),
+            1.3,
+        )
+        aligned = planner.update(
+            geometry(heading=5.0),
+            lidar_gap(0.0, reached=True),
+            1.35,
+        )
+        candidate = planner.update(
+            geometry(completion_candidate=True),
+            lidar_gap(
+                0.0,
+                reached=True,
+                scan_timestamp=2.0,
+            ),
+            1.4,
+        )
+        parked = planner.update(
+            geometry(completion_candidate=True),
+            lidar_gap(
+                0.0,
+                reached=True,
+                scan_timestamp=3.0,
+            ),
+            1.5,
+        )
+
+        self.assertEqual(lost.state, ParkingState.REACQUIRE_SLOT)
+        self.assertEqual(
+            fallback.state,
+            ParkingState.FINISH_REVERSE_TIMED,
+        )
+        self.assertEqual(fallback.command.speed, -40)
+        self.assertEqual(
+            fallback.command.steering,
+            planner.config.max_steering,
+        )
+        self.assertFalse(fallback.command.brake)
+        self.assertEqual(
+            still_reversing.state,
+            ParkingState.FINISH_REVERSE_TIMED,
+        )
+        self.assertEqual(still_reversing.command.speed, -40)
+        self.assertEqual(
+            still_reversing.command.steering,
+            planner.config.max_steering,
+        )
+        self.assertEqual(
+            still_reversing.reason,
+            "timed_finish_waiting_for_slot_completion",
+        )
+        self.assertEqual(aligned.command.speed, -40)
+        self.assertEqual(
+            aligned.command.steering,
+            planner.config.straight_steering_trim,
+        )
+        self.assertEqual(candidate.state, ParkingState.PARK_CONFIRM)
+        self.assertTrue(candidate.command.brake)
+        self.assertEqual(parked.state, ParkingState.PARKED)
+        self.assertEqual(
+            parked.reason,
+            "park_confirmed_on_first_stopped_scan",
+        )
+
+    def test_collision_during_curve_returns_to_forward_realign(self):
+        planner = self.make_prealign_planner()
+        planner.start(0.0)
+        planner.state = ParkingState.FOLLOW_ENTRY_CURVE
+        planner._state_started_at = 0.0
+        planner._preverify_state = ParkingState.PROVISIONAL_PREALIGN
+        planner._reverse_entry_mode = "lidar_box_curve"
+        planner._reverse_started = True
+        planner._reverse_path_armed = True
+        planner._armed_entry_steering = planner.config.max_steering
+        planner._armed_reverse_path = ReversePath(
+            found=True,
+            status=ReversePathStatus.READY,
+            entry_steering_ratio=1.0,
+            reason="full_arc_straight_ready",
+        )
+        collision = ReversePath(
+            found=False,
+            status=ReversePathStatus.COLLISION_RISK,
+            entry_steering_ratio=1.0,
+            reason="insufficient_side_clearance_for_reverse_path",
+        )
+        planner.path_generator.generate = lambda _geometry: collision
+
+        stopped = planner.update(
+            geometry(heading=40.0, remaining=650.0),
+            lidar_gap(0.0, reached=True),
+            0.5,
+        )
+        moving_forward = planner.update(
+            geometry(heading=40.0, remaining=650.0),
+            lidar_gap(0.0, reached=True),
+            0.6,
+        )
+
+        self.assertEqual(
+            stopped.state,
+            ParkingState.PROVISIONAL_PREALIGN,
+        )
+        self.assertTrue(stopped.command.brake)
+        self.assertIn("forward_realign_settle", stopped.reason)
+        self.assertFalse(planner._reverse_started)
+        self.assertEqual(
+            moving_forward.state,
+            ParkingState.PROVISIONAL_PREALIGN,
+        )
+        self.assertGreater(moving_forward.command.speed, 0)
+        self.assertEqual(
+            moving_forward.command.steering,
+            planner.config.prealign_steering,
+        )
+        self.assertNotEqual(
+            moving_forward.state,
+            ParkingState.FINISH_REVERSE_TIMED,
+        )
+
+    def test_reacquire_timeout_before_reverse_resumes_forward_alignment(self):
+        planner = self.make_prealign_planner()
+        self.enter_prealign(planner)
+        planner.config = replace(
+            planner.config,
+            slot_reacquire_timeout_s=0.2,
+        )
+        planner._enter(ParkingState.VERIFY_SLOT_BOX, 0.2)
+
+        lost = planner.update(
+            ParkingGeometry(reason="slot_map_depth_unobservable"),
+            lidar_gap(0.0, reached=True),
+            0.3,
+        )
+        resumed = planner.update(
+            ParkingGeometry(reason="slot_map_depth_unobservable"),
+            lidar_gap(0.0, reached=True),
+            0.6,
+        )
+
+        self.assertEqual(lost.state, ParkingState.REACQUIRE_SLOT)
+        self.assertEqual(
+            resumed.state,
+            ParkingState.PROVISIONAL_PREALIGN,
+        )
+        self.assertGreater(resumed.command.speed, 0)
+        self.assertFalse(resumed.command.brake)
+        self.assertEqual(
+            resumed.reason,
+            "slot_reacquire_timeout:resume_provisional_prealign",
+        )
+
+    def test_soft_deadline_finishes_an_already_armed_maneuver_before_four_minutes(
+        self,
+    ):
+        planner = TParkingPlanner(
+            ParkingPlannerConfig(
+                prealign_enabled=False,
+                start_forward_s=0.0,
+                reverse_entry_steer_settle_s=0.0,
+                mission_soft_deadline_s=225.0,
+                recovery_finish_total_s=1.5,
+                park_hold_s=3.0,
+                exit_turn_s=1.6,
+                exit_straight_s=0.0,
+                search_timeout_s=300.0,
+                gap_tracking_timeout_s=300.0,
+                position_timeout_s=300.0,
+            ),
+            ReversePathConfig(maximum_curvature_per_px=0.05),
+        )
+        self.arm_reverse(planner)
+
+        fallback = planner.update(
+            geometry(),
+            lidar_gap(0.0, reached=True),
+            225.0,
+        )
+        candidate = planner.update(
+            geometry(completion_candidate=True),
+            lidar_gap(
+                0.0,
+                reached=True,
+                scan_timestamp=2.0,
+            ),
+            226.6,
+        )
+        parked = planner.update(
+            geometry(completion_candidate=True),
+            lidar_gap(
+                0.0,
+                reached=True,
+                scan_timestamp=3.0,
+            ),
+            226.7,
+        )
+        exiting = planner.update(
+            geometry(),
+            lidar_gap(0.0, reached=True),
+            229.8,
+        )
+        done = planner.update(
+            geometry(),
+            lidar_gap(0.0, reached=True),
+            231.5,
+        )
+
+        self.assertEqual(
+            fallback.state,
+            ParkingState.FINISH_REVERSE_TIMED,
+        )
+        self.assertLess(fallback.command.speed, 0)
+        self.assertEqual(candidate.state, ParkingState.PARK_CONFIRM)
+        self.assertEqual(parked.state, ParkingState.PARKED)
+        self.assertEqual(exiting.state, ParkingState.EXIT_RIGHT)
+        self.assertEqual(done.state, ParkingState.EXIT_DONE)
+        self.assertLess(231.5, 240.0)
 
     def test_search_stops_after_rollout_while_waiting_for_lidar(self):
         planner = self.make_planner()
@@ -414,7 +952,11 @@ class TParkingPlannerTest(unittest.TestCase):
 
         rollout = planner.update(
             geometry(),
-            LidarParkingObservation(reason="no_scan"),
+            LidarParkingObservation(
+                valid=True,
+                observed_points=10,
+                reason="searching_for_parked_cars",
+            ),
             0.1,
         )
         waiting = planner.update(
@@ -427,6 +969,8 @@ class TParkingPlannerTest(unittest.TestCase):
         self.assertEqual(rollout.command.steering, -10)
         self.assertEqual(waiting.command.speed, 0)
         self.assertEqual(waiting.command.steering, 0)
+        self.assertEqual(waiting.state, ParkingState.EMERGENCY_STOP)
+        self.assertEqual(waiting.reason, "lidar_unavailable:no_scan")
         self.assertEqual(planner._prealign_steering(), -150)
         self.assertEqual(planner._fixed_right_entry_steering(), 150)
 
@@ -435,7 +979,6 @@ class TParkingPlannerTest(unittest.TestCase):
             ParkingPlannerConfig(
                 first_car_preemptive_turn_enabled=True,
                 start_forward_s=0.0,
-                first_car_straight_s=1.0,
                 search_timeout_s=100.0,
                 gap_tracking_timeout_s=100.0,
             )
@@ -468,7 +1011,6 @@ class TParkingPlannerTest(unittest.TestCase):
             ParkingPlannerConfig(
                 first_car_preemptive_turn_enabled=True,
                 start_forward_s=0.0,
-                first_car_straight_s=1.0,
                 search_timeout_s=100.0,
                 gap_tracking_timeout_s=100.0,
             )
@@ -493,7 +1035,7 @@ class TParkingPlannerTest(unittest.TestCase):
             ParkingPlannerConfig(
                 first_car_preemptive_turn_enabled=True,
                 start_forward_s=0.8,
-                first_car_straight_s=1.0,
+                provisional_prealign_speed=12,
                 search_timeout_s=100.0,
                 gap_tracking_timeout_s=100.0,
             )
@@ -504,7 +1046,6 @@ class TParkingPlannerTest(unittest.TestCase):
             geometry(),
             first_car_lidar(turn_reached=True, turn_error=-20.0),
             0.2,
-            left_ultrasonic_mm=500.0,
         )
         after_rollout = planner.update(
             geometry(),
@@ -522,12 +1063,27 @@ class TParkingPlannerTest(unittest.TestCase):
         self.assertEqual(rollout.command.steering, 0)
         self.assertFalse(rollout.command.brake)
         self.assertEqual(rollout.reason, "start_forward_rollout")
-        self.assertEqual(after_rollout.state, ParkingState.TRACK_GAP)
-        self.assertEqual(after_rollout.command.speed, planner.config.first_car_approach_speed)
-        self.assertEqual(after_rollout.command.steering, 0)
-        self.assertEqual(after_rollout.reason, "first_car_straight_delay")
-        self.assertEqual(after_delay.state, ParkingState.PREALIGN_LEFT)
-        self.assertEqual(after_delay.command.speed, 0)
+        self.assertEqual(
+            after_rollout.state,
+            ParkingState.PROVISIONAL_PREALIGN,
+        )
+        self.assertEqual(after_rollout.command.speed, 0)
+        self.assertEqual(
+            after_rollout.command.steering,
+            planner.config.prealign_steering,
+        )
+        self.assertEqual(
+            after_rollout.reason,
+            "first_car_turn_reached:provisional_settle_max_left",
+        )
+        self.assertEqual(
+            after_delay.state,
+            ParkingState.PROVISIONAL_PREALIGN,
+        )
+        self.assertEqual(
+            after_delay.command.speed,
+            planner.config.provisional_prealign_speed,
+        )
         self.assertEqual(after_delay.command.steering, planner.config.prealign_steering)
 
     def test_non_right_lidar_clusters_do_not_trigger_prealign(self):
@@ -535,7 +1091,6 @@ class TParkingPlannerTest(unittest.TestCase):
             ParkingPlannerConfig(
                 first_car_preemptive_turn_enabled=True,
                 start_forward_s=0.0,
-                first_car_straight_s=1.0,
                 search_timeout_s=100.0,
                 gap_tracking_timeout_s=100.0,
             )
@@ -569,8 +1124,8 @@ class TParkingPlannerTest(unittest.TestCase):
             ParkingPlannerConfig(
                 first_car_preemptive_turn_enabled=True,
                 start_forward_s=0.0,
-                first_car_straight_s=0.0,
                 prealign_enabled=True,
+                provisional_prealign_speed=12,
                 prealign_speed=35,
                 prealign_steering=-150,
                 prealign_steer_settle_s=0.0,
@@ -602,15 +1157,27 @@ class TParkingPlannerTest(unittest.TestCase):
         )
 
         self.assertEqual(tracking.state, ParkingState.TRACK_GAP)
-        self.assertEqual(turn_point.state, ParkingState.PREALIGN_LEFT)
-        self.assertEqual(still_searching.state, ParkingState.PREALIGN_LEFT)
+        self.assertEqual(
+            turn_point.state,
+            ParkingState.PROVISIONAL_PREALIGN,
+        )
+        self.assertEqual(
+            still_searching.state,
+            ParkingState.PROVISIONAL_PREALIGN,
+        )
         self.assertEqual(turn_point.command.speed, 0)
-        self.assertEqual(still_searching.command.speed, planner.config.prealign_speed)
+        self.assertEqual(
+            still_searching.command.speed,
+            planner.config.provisional_prealign_speed,
+        )
         self.assertEqual(turn_point.command.steering, planner.config.prealign_steering)
         self.assertEqual(still_searching.command.steering, planner.config.prealign_steering)
         self.assertFalse(turn_point.command.brake)
         self.assertFalse(still_searching.command.brake)
-        self.assertEqual(still_searching.reason, "prealign_left_waiting_for_second_car")
+        self.assertEqual(
+            still_searching.reason,
+            "provisional_prealign_waiting_for_second_car",
+        )
 
     def test_prealign_missing_tracked_slot_keeps_moving(self):
         planner = self.make_prealign_planner()
@@ -628,6 +1195,52 @@ class TParkingPlannerTest(unittest.TestCase):
         self.assertFalse(waiting.command.brake)
         self.assertEqual(waiting.reason, "prealign_waiting_for_tracked_slot")
 
+    def test_provisional_prealign_stops_on_first_safe_path_candidate(self):
+        planner = TParkingPlanner(
+            ParkingPlannerConfig(
+                first_car_preemptive_turn_enabled=True,
+                start_forward_s=0.0,
+                provisional_prealign_speed=8,
+                prealign_speed=35,
+                prealign_steering=-150,
+                prealign_steer_settle_s=0.0,
+                search_timeout_s=100.0,
+                gap_tracking_timeout_s=100.0,
+            )
+        )
+        planner.start(0.0)
+        planner.update(geometry(), first_car_lidar(), 0.1)
+        entered = planner.update(
+            geometry(),
+            first_car_lidar(turn_reached=True, turn_error=-20.0),
+            0.2,
+        )
+
+        stopped = planner.update(
+            geometry(
+                heading=40.0,
+                lateral=0.2,
+                remaining=650.0,
+                reason="lidar_slot_box",
+            ),
+            prealign_lidar(
+                slot_heading_deg=40.0,
+                entry_bearing_deg=40.0,
+                distance_mm=1200.0,
+            ),
+            0.3,
+        )
+
+        self.assertEqual(
+            entered.state,
+            ParkingState.PROVISIONAL_PREALIGN,
+        )
+        self.assertEqual(entered.command.steering, -150)
+        self.assertEqual(stopped.state, ParkingState.VERIFY_SLOT_BOX)
+        self.assertEqual(stopped.command.speed, 0)
+        self.assertTrue(stopped.command.brake)
+        self.assertEqual(stopped.reason, "provisional_safe_path_ready")
+
     def test_prealign_visible_slot_box_must_be_centered_before_reverse_setup(self):
         planner = self.make_prealign_planner()
         self.enter_prealign(planner)
@@ -641,7 +1254,7 @@ class TParkingPlannerTest(unittest.TestCase):
             ),
             prealign_lidar(
                 slot_heading_deg=47.0,
-                entry_bearing_deg=46.0,
+                entry_bearing_deg=89.0,
                 distance_mm=1590.0,
             ),
             0.2,
@@ -672,44 +1285,109 @@ class TParkingPlannerTest(unittest.TestCase):
             lidar,
             0.2,
         )
-        ready = planner.update(
-            geometry(
-                heading=40.0,
-                lateral=0.2,
-                remaining=650.0,
-                reason="lidar_slot_box",
-            ),
-            lidar,
-            0.3,
+        self.assertEqual(confirming.state, ParkingState.VERIFY_SLOT_BOX)
+        self.assertEqual(
+            confirming.reason,
+            "prealign_curve_reverse_ready:first_candidate",
         )
+        self.assertTrue(confirming.command.brake)
 
-        self.assertEqual(confirming.state, ParkingState.PREALIGN_LEFT)
-        self.assertEqual(ready.state, ParkingState.VERIFY_SLOT_BOX)
-        self.assertEqual(ready.reason, "prealign_curve_reverse_ready")
-        self.assertTrue(ready.command.brake)
-
-    def test_prealign_curve_uses_geometry_heading_instead_of_raw_lidar_heading(self):
+    def test_full_lock_curve_entry_uses_heading_hysteresis_without_stopping(self):
         planner = self.make_prealign_planner()
         self.enter_prealign(planner)
         lidar = prealign_lidar(
-            slot_heading_deg=65.0,
-            entry_bearing_deg=20.0,
-            distance_mm=1500.0,
+            slot_heading_deg=60.0,
+            entry_bearing_deg=45.0,
+            distance_mm=1200.0,
         )
-        slot_geometry = geometry(
-            heading=40.0,
-            lateral=0.2,
-            remaining=650.0,
-            reason="lidar_slot_box",
+        saturated_path = ReversePath(
+            found=True,
+            status=ReversePathStatus.READY,
+            entry_steering_ratio=1.0,
+            reason="full_arc_straight_ready",
+        )
+        planner.path_generator.generate = lambda _geometry: saturated_path
+
+        blocked = planner.update(
+            geometry(heading=50.1, reason="lidar_slot_box"),
+            lidar,
+            0.2,
+        )
+        still_blocked = planner.update(
+            geometry(heading=49.0, reason="lidar_slot_box"),
+            lidar,
+            0.3,
+        )
+        released = planner.update(
+            geometry(heading=47.9, reason="lidar_slot_box"),
+            lidar,
+            0.4,
         )
 
-        confirming = planner.update(slot_geometry, lidar, 0.2)
-        ready = planner.update(slot_geometry, lidar, 0.3)
+        self.assertEqual(blocked.state, ParkingState.PREALIGN_LEFT)
+        self.assertEqual(blocked.command.speed, planner.config.prealign_speed)
+        self.assertFalse(blocked.command.brake)
+        self.assertIn("prealign_curve_entry_guard", blocked.reason)
+        self.assertEqual(still_blocked.state, ParkingState.PREALIGN_LEFT)
+        self.assertEqual(still_blocked.command.speed, planner.config.prealign_speed)
+        self.assertEqual(released.state, ParkingState.VERIFY_SLOT_BOX)
+        self.assertEqual(
+            released.reason,
+            "prealign_curve_reverse_ready:first_candidate",
+        )
+        self.assertTrue(released.command.brake)
+
+    def test_low_steering_curve_path_cannot_arm_fixed_full_lock_command(self):
+        planner = self.make_prealign_planner()
+        self.enter_prealign(planner)
+        lidar = prealign_lidar(
+            slot_heading_deg=60.0,
+            entry_bearing_deg=45.0,
+            distance_mm=1200.0,
+        )
+        planner.path_generator.generate = lambda _geometry: ReversePath(
+            found=True,
+            status=ReversePathStatus.READY,
+            entry_steering_ratio=0.8,
+            reason="full_arc_straight_ready",
+        )
+
+        confirming = planner.update(
+            geometry(heading=57.7, reason="lidar_slot_box"),
+            lidar,
+            0.2,
+        )
 
         self.assertEqual(confirming.state, ParkingState.PREALIGN_LEFT)
-        self.assertEqual(ready.state, ParkingState.VERIFY_SLOT_BOX)
-        self.assertEqual(ready.reason, "prealign_curve_reverse_ready")
-        self.assertTrue(ready.command.brake)
+        self.assertGreater(confirming.command.speed, 0)
+        self.assertIn(
+            "prealign_full_lock_path_required",
+            confirming.reason,
+        )
+
+    def test_point_nine_curve_path_is_blocked_until_heading_releases(self):
+        planner = self.make_prealign_planner()
+        self.enter_prealign(planner)
+        lidar = prealign_lidar(
+            slot_heading_deg=60.0,
+            entry_bearing_deg=45.0,
+            distance_mm=1200.0,
+        )
+        planner.path_generator.generate = lambda _geometry: ReversePath(
+            found=True,
+            status=ReversePathStatus.READY,
+            entry_steering_ratio=0.9,
+            reason="full_arc_straight_ready",
+        )
+
+        blocked = planner.update(
+            geometry(heading=50.1, reason="lidar_slot_box"),
+            lidar,
+            0.2,
+        )
+
+        self.assertEqual(blocked.state, ParkingState.PREALIGN_LEFT)
+        self.assertIn("prealign_full_lock_path_required", blocked.reason)
 
     def test_reverse_entry_switches_to_right_steering_after_left_prealign(self):
         planner = self.make_prealign_planner()
@@ -740,7 +1418,46 @@ class TParkingPlannerTest(unittest.TestCase):
 
         self.assertEqual(steering, planner.config.reverse_entry_min_steering)
 
-    def test_curve_reverse_keeps_maximum_right_when_local_path_changes_side(self):
+    def test_full_path_candidate_ratio_maps_to_configurable_steering(self):
+        planner = self.make_planner()
+        path = ReversePath(
+            found=True,
+            curvature_per_px=0.004,
+            entry_steering_ratio=0.8,
+            reason="full_arc_straight_ready",
+        )
+
+        steering = planner._candidate_entry_steering(path)
+
+        self.assertEqual(steering, 120)
+
+    def test_curve_arm_uses_maximum_right_steering_not_candidate_ratio(self):
+        planner = self.make_planner()
+        planner.path_generator.generate = lambda _geometry: ReversePath(
+            found=True,
+            status=ReversePathStatus.READY,
+            curvature_per_px=0.004,
+            entry_steering_ratio=1.0,
+            reason="full_arc_straight_ready",
+        )
+        planner.start(0.0)
+        planner.update(geometry(), lidar_gap(), 0.0)
+        planner.update(geometry(), lidar_gap(), 0.1)
+        planner.update(geometry(), lidar_gap(0.0, reached=True), 0.2)
+
+        armed = planner.update(
+            geometry(),
+            lidar_gap(0.0, reached=True),
+            0.3,
+        )
+
+        self.assertEqual(armed.state, ParkingState.SET_REVERSE_STEER)
+        self.assertEqual(
+            armed.command.steering,
+            planner.config.max_steering,
+        )
+
+    def test_curve_reverse_keeps_armed_candidate_when_local_path_changes_side(self):
         planner = self.make_planner()
         self.arm_reverse(planner)
 
@@ -773,23 +1490,22 @@ class TParkingPlannerTest(unittest.TestCase):
             self.assertEqual(plan.state, ParkingState.FOLLOW_ENTRY_CURVE)
             self.assertLess(plan.command.speed, 0)
             self.assertEqual(plan.command.steering, planner.config.max_steering)
-            self.assertIn("following_entry_fixed_max_right", plan.reason)
+            self.assertEqual(
+                plan.reason,
+                "following_entry_curve:candidate_steer",
+            )
 
-    def test_curve_reverse_releases_after_stable_heading_confirmation(self):
+    def test_curve_reverse_release_uses_one_heading_scan_after_minimum_time(self):
         planner = TParkingPlanner(
             ParkingPlannerConfig(
                 prealign_enabled=False,
                 start_forward_s=0.0,
-                verify_hold_s=0.0,
                 search_timeout_s=100.0,
                 gap_tracking_timeout_s=100.0,
                 position_timeout_s=100.0,
-                verify_timeout_s=100.0,
-                path_timeout_s=100.0,
-                path_confirm_frames=1,
                 reverse_entry_steer_settle_s=0.0,
-                reverse_entry_release_heading_deg=12.0,
-                reverse_entry_release_confirm_frames=3,
+                reverse_entry_curve_s=0.3,
+                reverse_entry_steering_release_s=0.4,
                 entry_curve_timeout_s=100.0,
                 center_follow_timeout_s=100.0,
             ),
@@ -797,30 +1513,66 @@ class TParkingPlannerTest(unittest.TestCase):
         )
         self.arm_reverse(planner)
 
-        first = planner.update(
-            geometry(heading=12.0, lateral=0.2, remaining=650.0),
+        curving = planner.update(
+            geometry(heading=70.0, lateral=0.0, remaining=650.0),
             lidar_gap(0.0, reached=True),
             0.5,
         )
-        second = planner.update(
-            geometry(heading=10.0, lateral=0.2, remaining=640.0),
+        still_turning = planner.update(
+            geometry(heading=70.0, lateral=0.0, remaining=640.0),
             lidar_gap(0.0, reached=True),
-            0.6,
+            0.81,
+        )
+        release_start = planner.update(
+            geometry(heading=10.0, lateral=0.0, remaining=635.0),
+            lidar_gap(0.0, reached=True),
+            0.82,
+        )
+        releasing = planner.update(
+            geometry(heading=8.0, lateral=0.0, remaining=630.0),
+            lidar_gap(0.0, reached=True),
+            1.02,
         )
         released = planner.update(
-            geometry(heading=8.0, lateral=0.2, remaining=630.0),
+            geometry(heading=5.0, lateral=0.0, remaining=620.0),
             lidar_gap(0.0, reached=True),
-            0.7,
+            1.23,
         )
 
-        for plan in (first, second):
-            self.assertEqual(plan.state, ParkingState.FOLLOW_ENTRY_CURVE)
-            self.assertEqual(plan.command.steering, planner.config.max_steering)
+        self.assertEqual(curving.state, ParkingState.FOLLOW_ENTRY_CURVE)
+        self.assertEqual(
+            curving.command.steering,
+            planner.config.max_steering,
+        )
+        self.assertEqual(
+            still_turning.state,
+            ParkingState.FOLLOW_ENTRY_CURVE,
+        )
+        self.assertEqual(
+            release_start.state,
+            ParkingState.RELEASE_ENTRY_STEER,
+        )
+        self.assertEqual(
+            release_start.command.steering,
+            planner.config.max_steering,
+        )
+        self.assertEqual(release_start.command.speed, 0)
+        self.assertEqual(
+            release_start.reason,
+            "release_entry_steer:heading_ready_stop",
+        )
+        self.assertEqual(releasing.state, ParkingState.RELEASE_ENTRY_STEER)
+        self.assertEqual(releasing.command.speed, 0)
+        self.assertGreater(releasing.command.steering, 0)
+        self.assertLess(
+            releasing.command.steering,
+            planner.config.max_steering,
+        )
         self.assertEqual(released.state, ParkingState.FOLLOW_SLOT_CENTER)
         self.assertLess(released.command.speed, 0)
         self.assertEqual(
             released.reason,
-            "following_slot_center:entry_heading_released",
+            "following_slot_center:entry_steering_released",
         )
 
     def test_fresh_aligned_obstacles_switch_to_trimmed_straight_reverse(self):
@@ -831,15 +1583,12 @@ class TParkingPlannerTest(unittest.TestCase):
                 aligned_confirm_frames=2,
                 prealign_enabled=False,
                 start_forward_s=0.0,
-                verify_hold_s=0.0,
                 search_timeout_s=100.0,
                 gap_tracking_timeout_s=100.0,
                 position_timeout_s=100.0,
-                verify_timeout_s=100.0,
-                path_timeout_s=100.0,
-                path_confirm_frames=1,
                 reverse_entry_steer_settle_s=0.0,
-                reverse_entry_release_confirm_frames=1,
+                reverse_entry_curve_s=0.0,
+                reverse_entry_steering_release_s=0.0,
                 entry_curve_timeout_s=100.0,
                 center_follow_timeout_s=100.0,
             ),
@@ -852,15 +1601,20 @@ class TParkingPlannerTest(unittest.TestCase):
             0.5,
         )
 
-        confirming = planner.update(
+        planner.update(
             geometry(heading=4.0, lateral=0.1, remaining=490.0),
             lidar_gap(0.0, reached=True, pair_observed=True),
             0.6,
         )
-        straight = planner.update(
+        confirming = planner.update(
             geometry(heading=3.0, lateral=0.1, remaining=480.0),
             lidar_gap(0.0, reached=True, pair_observed=True),
             0.7,
+        )
+        straight = planner.update(
+            geometry(heading=3.0, lateral=0.1, remaining=470.0),
+            lidar_gap(0.0, reached=True, pair_observed=True),
+            0.8,
         )
 
         self.assertEqual(confirming.state, ParkingState.FOLLOW_SLOT_CENTER)
@@ -871,27 +1625,22 @@ class TParkingPlannerTest(unittest.TestCase):
             "following_slot_center:aligned_straight",
         )
 
-    def test_aligned_straight_reverse_parks_when_body_mid_is_inside(self):
+    def test_aligned_reverse_time_limit_waits_for_real_completion(self):
         planner = TParkingPlanner(
             ParkingPlannerConfig(
                 straight_steering_trim=-20,
                 reverse_aligned_speed=-40,
-                ultrasonic_inside_max_mm=600.0,
-                ultrasonic_inside_confirm_frames=3,
                 aligned_confirm_frames=1,
                 aligned_reverse_min_s=0.4,
                 aligned_reverse_max_s=2.5,
                 prealign_enabled=False,
                 start_forward_s=0.0,
-                verify_hold_s=0.0,
                 search_timeout_s=100.0,
                 gap_tracking_timeout_s=100.0,
                 position_timeout_s=100.0,
-                verify_timeout_s=100.0,
-                path_timeout_s=100.0,
-                path_confirm_frames=1,
                 reverse_entry_steer_settle_s=0.0,
-                reverse_entry_release_confirm_frames=1,
+                reverse_entry_curve_s=0.0,
+                reverse_entry_steering_release_s=0.0,
                 entry_curve_timeout_s=100.0,
                 center_follow_timeout_s=100.0,
             ),
@@ -910,95 +1659,34 @@ class TParkingPlannerTest(unittest.TestCase):
         )
         planner.update(aligned_geometry, aligned_lidar, 0.5)
         planner.update(aligned_geometry, aligned_lidar, 0.6)
+        straight = planner.update(aligned_geometry, aligned_lidar, 0.7)
 
-        first = planner.update(
+        still_reversing = planner.update(
             aligned_geometry,
             aligned_lidar,
-            0.7,
-            left_ultrasonic_mm=550.0,
-            right_ultrasonic_mm=560.0,
+            3.3,
         )
-        second = planner.update(
-            aligned_geometry,
-            aligned_lidar,
-            0.8,
-            left_ultrasonic_mm=550.0,
-            right_ultrasonic_mm=560.0,
-        )
-        parked = planner.update(
-            aligned_geometry,
-            aligned_lidar,
-            1.0,
-            left_ultrasonic_mm=550.0,
-            right_ultrasonic_mm=560.0,
-        )
-
-        self.assertLess(first.command.speed, 0)
-        self.assertLess(second.command.speed, 0)
-        self.assertEqual(parked.state, ParkingState.PARKED)
-        self.assertEqual(parked.reason, "body_mid_inside_and_aligned")
-        self.assertTrue(parked.command.brake)
-
-    def test_aligned_straight_reverse_has_bounded_fallback_duration(self):
-        planner = TParkingPlanner(
-            ParkingPlannerConfig(
-                straight_steering_trim=-20,
-                reverse_aligned_speed=-40,
-                aligned_confirm_frames=1,
-                aligned_reverse_min_s=0.4,
-                aligned_reverse_max_s=2.5,
-                prealign_enabled=False,
-                start_forward_s=0.0,
-                verify_hold_s=0.0,
-                search_timeout_s=100.0,
-                gap_tracking_timeout_s=100.0,
-                position_timeout_s=100.0,
-                verify_timeout_s=100.0,
-                path_timeout_s=100.0,
-                path_confirm_frames=1,
-                reverse_entry_steer_settle_s=0.0,
-                reverse_entry_release_confirm_frames=1,
-                entry_curve_timeout_s=100.0,
-                center_follow_timeout_s=100.0,
-            ),
-            ReversePathConfig(maximum_curvature_per_px=0.05),
-        )
-        self.arm_reverse(planner)
-        aligned_geometry = geometry(
-            heading=3.0,
-            lateral=0.1,
-            remaining=480.0,
-        )
-        aligned_lidar = lidar_gap(
-            0.0,
-            reached=True,
-            pair_observed=True,
-        )
-        planner.update(aligned_geometry, aligned_lidar, 0.5)
-        straight = planner.update(aligned_geometry, aligned_lidar, 0.6)
-
-        parked = planner.update(aligned_geometry, aligned_lidar, 3.1)
 
         self.assertEqual(straight.command.speed, -40)
-        self.assertEqual(parked.state, ParkingState.PARKED)
         self.assertEqual(
-            parked.reason,
-            "aligned_straight_reverse_complete",
+            still_reversing.state,
+            ParkingState.FOLLOW_SLOT_CENTER,
         )
-        self.assertTrue(parked.command.brake)
+        self.assertEqual(
+            still_reversing.reason,
+            "following_slot_center:aligned_waiting_for_completion",
+        )
+        self.assertEqual(still_reversing.command.speed, -40)
+        self.assertFalse(still_reversing.command.brake)
 
     def test_curve_reverse_settles_maximum_right_before_moving(self):
         planner = TParkingPlanner(
             ParkingPlannerConfig(
                 prealign_enabled=False,
                 start_forward_s=0.0,
-                verify_hold_s=0.0,
                 search_timeout_s=100.0,
                 gap_tracking_timeout_s=100.0,
                 position_timeout_s=100.0,
-                verify_timeout_s=100.0,
-                path_timeout_s=100.0,
-                path_confirm_frames=1,
                 reverse_entry_steer_settle_s=0.4,
                 entry_curve_timeout_s=100.0,
             ),
@@ -1017,9 +1705,14 @@ class TParkingPlannerTest(unittest.TestCase):
             0.9,
         )
 
+        self.assertEqual(settling.state, ParkingState.SET_REVERSE_STEER)
         self.assertEqual(settling.command.speed, 0)
         self.assertEqual(settling.command.steering, planner.config.max_steering)
-        self.assertEqual(settling.reason, "reverse_entry_max_right:settling")
+        self.assertEqual(
+            settling.reason,
+            "reverse_entry_candidate_steer:settling",
+        )
+        self.assertEqual(reversing.state, ParkingState.FOLLOW_ENTRY_CURVE)
         self.assertLess(reversing.command.speed, 0)
         self.assertEqual(reversing.command.steering, planner.config.max_steering)
 
@@ -1046,7 +1739,17 @@ class TParkingPlannerTest(unittest.TestCase):
                 reason="lidar_slot_box",
             ),
             lidar_gap(0.0, reached=True),
-            1.4,
+            2.0,
+        )
+        released = planner.update(
+            geometry(
+                heading=0.0,
+                lateral=0.0,
+                remaining=580.0,
+                reason="lidar_slot_box",
+            ),
+            lidar_gap(0.0, reached=True),
+            2.7,
         )
 
         self.assertEqual(first_reverse.state, ParkingState.FOLLOW_ENTRY_CURVE)
@@ -1057,15 +1760,28 @@ class TParkingPlannerTest(unittest.TestCase):
             reverse_settle,
             correcting_reverse,
         ):
-            self.assertEqual(plan.state, ParkingState.FOLLOW_ENTRY_CURVE)
+            self.assertIn(
+                plan.state,
+                (
+                    ParkingState.FOLLOW_ENTRY_CURVE,
+                    ParkingState.RELEASE_ENTRY_STEER,
+                ),
+            )
             self.assertLess(plan.command.speed, 0)
-            self.assertEqual(plan.command.steering, planner.config.max_steering)
-        self.assertEqual(aligned.state, ParkingState.FOLLOW_SLOT_CENTER)
-        self.assertLess(aligned.command.speed, 0)
-        self.assertEqual(aligned.command.steering, 0)
+            self.assertNotIn(
+                plan.state,
+                (
+                    ParkingState.CORRECT_FORWARD,
+                    ParkingState.CORRECT_REVERSE,
+                ),
+            )
+        self.assertEqual(aligned.state, ParkingState.RELEASE_ENTRY_STEER)
+        self.assertEqual(released.state, ParkingState.FOLLOW_SLOT_CENTER)
+        self.assertLess(released.command.speed, 0)
+        self.assertEqual(released.command.steering, 0)
         self.assertEqual(
-            aligned.reason,
-            "following_slot_center:entry_heading_released",
+            released.reason,
+            "following_slot_center:entry_steering_released",
         )
 
     def test_lidar_obstacle_latches_emergency_stop(self):
@@ -1089,9 +1805,29 @@ class TParkingPlannerTest(unittest.TestCase):
             0.5,
         )
 
-        self.assertEqual(stopped.state, ParkingState.FOLLOW_ENTRY_CURVE)
+        self.assertEqual(stopped.state, ParkingState.EMERGENCY_STOP)
         self.assertTrue(stopped.command.brake)
-        self.assertEqual(stopped.reason, "lidar_unavailable_during_reverse")
+        self.assertEqual(stopped.reason, "lidar_unavailable:stale_scan")
+
+    def test_lidar_loss_during_prealign_latches_emergency_stop(self):
+        planner = self.make_prealign_planner()
+        self.enter_prealign(planner)
+
+        stopped = planner.update(
+            geometry(),
+            LidarParkingObservation(reason="lidar_error:disconnected"),
+            0.2,
+        )
+        latched = planner.update(geometry(), prealign_lidar(), 0.3)
+
+        self.assertEqual(stopped.state, ParkingState.EMERGENCY_STOP)
+        self.assertTrue(stopped.command.brake)
+        self.assertEqual(
+            stopped.reason,
+            "lidar_unavailable:lidar_error:disconnected",
+        )
+        self.assertEqual(latched.state, ParkingState.EMERGENCY_STOP)
+        self.assertEqual(latched.reason, "emergency_stop_latched")
 
     def test_legacy_rear_axle_positioning_corrects_in_both_directions(self):
         planner = self.make_planner()
@@ -1114,7 +1850,11 @@ class TParkingPlannerTest(unittest.TestCase):
 
         moving = planner.update(
             geometry(),
-            prealign_lidar(slot_heading_deg=70.0, entry_bearing_deg=65.0),
+            prealign_lidar(
+                slot_heading_deg=70.0,
+                entry_bearing_deg=89.0,
+                distance_mm=1600.0,
+            ),
             0.2,
         )
 
@@ -1129,7 +1869,7 @@ class TParkingPlannerTest(unittest.TestCase):
                 first_car_preemptive_turn_enabled=True,
                 start_forward_s=0.0,
                 first_car_approach_speed=10,
-                first_car_straight_s=1.0,
+                provisional_prealign_speed=8,
                 prealign_speed=35,
                 prealign_steering=-150,
                 prealign_steer_settle_s=0.4,
@@ -1158,19 +1898,34 @@ class TParkingPlannerTest(unittest.TestCase):
 
         self.assertEqual(creeping.state, ParkingState.TRACK_GAP)
         self.assertEqual(creeping.command.speed, 10)
-        self.assertEqual(settling.state, ParkingState.TRACK_GAP)
-        self.assertEqual(settling.command.speed, 10)
-        self.assertEqual(settling.command.steering, 0)
-        self.assertEqual(settling.reason, "first_car_straight_delay")
-        self.assertEqual(delayed.state, ParkingState.TRACK_GAP)
-        self.assertEqual(delayed.command.speed, 10)
-        self.assertEqual(delayed.command.steering, 0)
-        self.assertEqual(turning.state, ParkingState.PREALIGN_LEFT)
-        self.assertEqual(turning.command.speed, 0)
+        self.assertEqual(
+            settling.state,
+            ParkingState.PROVISIONAL_PREALIGN,
+        )
+        self.assertEqual(settling.command.speed, 0)
+        self.assertEqual(settling.command.steering, -150)
+        self.assertEqual(
+            settling.reason,
+            "first_car_turn_reached:provisional_settle_max_left",
+        )
+        self.assertEqual(
+            delayed.state,
+            ParkingState.PROVISIONAL_PREALIGN,
+        )
+        self.assertEqual(delayed.command.speed, 8)
+        self.assertEqual(delayed.command.steering, -150)
+        self.assertEqual(
+            turning.state,
+            ParkingState.PROVISIONAL_PREALIGN,
+        )
+        self.assertEqual(turning.command.speed, 8)
         self.assertEqual(turning.command.steering, -150)
-        self.assertEqual(turning.reason, "first_car_straight_elapsed:settling_max_left")
+        self.assertLess(
+            turning.command.speed,
+            planner.config.prealign_speed,
+        )
 
-    def test_prealign_direct_reverse_requires_stable_heading_and_bearing(self):
+    def test_direct_angles_select_mode_without_extra_confirmation_frames(self):
         planner = self.make_prealign_planner()
         self.enter_prealign(planner)
         aligned_lidar = prealign_lidar(
@@ -1179,13 +1934,17 @@ class TParkingPlannerTest(unittest.TestCase):
             distance_mm=900.0,
         )
 
-        confirming = planner.update(geometry(), aligned_lidar, 0.2)
-        ready = planner.update(geometry(), aligned_lidar, 0.3)
+        verifying = planner.update(geometry(), aligned_lidar, 0.2)
+        armed = planner.update(geometry(), aligned_lidar, 0.3)
 
-        self.assertEqual(confirming.state, ParkingState.PREALIGN_LEFT)
-        self.assertEqual(ready.state, ParkingState.VERIFY_SLOT_BOX)
-        self.assertEqual(ready.reason, "prealign_direct_reverse_ready")
-        self.assertTrue(ready.command.brake)
+        self.assertEqual(verifying.state, ParkingState.VERIFY_SLOT_BOX)
+        self.assertEqual(
+            verifying.reason,
+            "prealign_direct_reverse_ready:first_candidate",
+        )
+        self.assertEqual(armed.state, ParkingState.FOLLOW_SLOT_CENTER)
+        self.assertEqual(armed.reason, "reverse_path_armed:direct")
+        self.assertTrue(armed.command.brake)
 
     def test_prealign_timeout_continues_when_path_is_not_feasible(self):
         planner = self.make_prealign_planner()
@@ -1206,93 +1965,6 @@ class TParkingPlannerTest(unittest.TestCase):
         self.assertEqual(fallback.reason, "prealign_alignment_timeout:continuing")
         self.assertEqual(fallback.command.speed, planner.config.prealign_speed)
         self.assertFalse(fallback.command.brake)
-
-    def test_side_ultrasonic_emergency_stop_is_latched(self):
-        planner = self.make_planner()
-        self.arm_reverse(planner)
-
-        stopped = planner.update(
-            geometry(),
-            lidar_gap(),
-            0.5,
-            left_ultrasonic_mm=95.0,
-            right_ultrasonic_mm=500.0,
-        )
-        still_stopped = planner.update(geometry(), lidar_gap(), 0.6)
-
-        self.assertEqual(stopped.state, ParkingState.EMERGENCY_STOP)
-        self.assertTrue(stopped.command.brake)
-        self.assertEqual(still_stopped.state, ParkingState.EMERGENCY_STOP)
-
-    def test_side_ultrasonic_is_ignored_during_forward_search(self):
-        planner = TParkingPlanner(
-            ParkingPlannerConfig(start_forward_s=0.0, search_timeout_s=100.0)
-        )
-        planner.start(0.0)
-
-        moving = planner.update(
-            geometry(),
-            LidarParkingObservation(
-                timestamp=1.0,
-                valid=True,
-                observed_points=10,
-                reason="searching_for_parked_cars",
-            ),
-            0.1,
-            left_ultrasonic_mm=95.0,
-            right_ultrasonic_mm=95.0,
-        )
-
-        self.assertEqual(moving.state, ParkingState.SEARCH_CARS)
-        self.assertGreater(moving.command.speed, 0)
-        self.assertFalse(moving.command.brake)
-
-    def test_front_ultrasonic_is_ignored_during_forward_search(self):
-        planner = TParkingPlanner(
-            ParkingPlannerConfig(start_forward_s=0.0, search_timeout_s=100.0)
-        )
-        planner.start(0.0)
-
-        moving = planner.update(
-            geometry(),
-            LidarParkingObservation(
-                timestamp=1.0,
-                valid=True,
-                observed_points=10,
-                reason="searching_for_parked_cars",
-            ),
-            0.1,
-            front_left_ultrasonic_mm=95.0,
-            front_right_ultrasonic_mm=500.0,
-        )
-
-        self.assertEqual(moving.state, ParkingState.SEARCH_CARS)
-        self.assertGreater(moving.command.speed, 0)
-        self.assertFalse(moving.command.brake)
-
-    def test_front_ultrasonic_does_not_block_reverse_motion(self):
-        planner = self.make_planner()
-        self.arm_reverse(planner)
-
-        reversing = planner.update(
-            geometry(heading=20.0, lateral=0.4, remaining=700.0),
-            lidar_gap(0.0, reached=True),
-            0.5,
-            front_left_ultrasonic_mm=95.0,
-            front_right_ultrasonic_mm=95.0,
-        )
-
-        self.assertEqual(reversing.state, ParkingState.FOLLOW_ENTRY_CURVE)
-        self.assertLess(reversing.command.speed, 0)
-
-    def test_side_ultrasonic_p_control_is_bounded(self):
-        planner = self.make_planner()
-
-        self.assertEqual(planner._ultrasonic_correction(500.0, 500.0), 0)
-        self.assertEqual(planner._ultrasonic_correction(400.0, 800.0), 35)
-        self.assertEqual(planner._ultrasonic_correction(800.0, 400.0), -35)
-        self.assertEqual(planner._ultrasonic_correction(None, 400.0), 0)
-
 
 if __name__ == "__main__":
     unittest.main()

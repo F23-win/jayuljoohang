@@ -54,8 +54,12 @@ class ParkingGeometry:
     depth_to_back_px: Optional[float] = None
     depth_remaining_px: Optional[float] = None
     slot_width_px: Optional[float] = None
+    slot_depth_px: Optional[float] = None
     vehicle_x_px: float = 0.0
     vehicle_y_px: float = 0.0
+    vehicle_width_px: Optional[float] = None
+    vehicle_length_px: Optional[float] = None
+    rear_axle_to_rear_bumper_px: Optional[float] = None
     slot_center_x_px: Optional[float] = None
     slot_center_y_px: Optional[float] = None
     slot_direction_x: float = 0.0
@@ -66,6 +70,16 @@ class ParkingGeometry:
     stop_target_y_px: Optional[float] = None
     vehicle_inside_ratio: float = 0.0
     vehicle_fully_inside: bool = False
+    vehicle_footprint_slot_local_mm: Tuple[
+        Tuple[float, float],
+        ...,
+    ] = ()
+    vehicle_footprint_min_lateral_mm: Optional[float] = None
+    vehicle_footprint_max_lateral_mm: Optional[float] = None
+    vehicle_footprint_min_depth_mm: Optional[float] = None
+    vehicle_footprint_max_depth_mm: Optional[float] = None
+    park_completion_candidate: bool = False
+    park_completion_reason: str = "footprint_unavailable"
     confidence: float = 0.0
     observed_line_count: int = 0
     coasted: bool = False

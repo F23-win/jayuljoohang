@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from math import atan2, degrees, hypot
 from typing import Optional, Sequence, Tuple
 
@@ -12,6 +13,19 @@ from .parking_lidar import (
 
 
 Point = Tuple[float, float]
+
+
+@dataclass(frozen=True)
+class SlotFootprintMeasurement:
+    corners_local_mm: Tuple[Point, Point, Point, Point]
+    min_lateral_mm: float
+    max_lateral_mm: float
+    min_depth_mm: float
+    max_depth_mm: float
+    inside_ratio: float
+    fully_inside: bool
+    completion_candidate: bool
+    reason: str
 
 
 class LidarSlotGeometryProjector:
@@ -32,6 +46,8 @@ class LidarSlotGeometryProjector:
         vehicle_width_mm: float = 600.0,
         vehicle_length_mm: float = 1000.0,
         rear_axle_to_rear_bumper_mm: float = 200.0,
+        sensor_behind_vehicle_rear_mm: Optional[float] = None,
+        park_completion_clearance_mm: float = 20.0,
     ) -> None:
         if canvas_width <= 0 or canvas_height <= 0:
             raise ValueError("LiDAR slot geometry canvas must be positive")
@@ -47,6 +63,20 @@ class LidarSlotGeometryProjector:
             float(rear_axle_to_rear_bumper_mm),
             0.0,
             self.vehicle_length_mm,
+        )
+        if sensor_behind_vehicle_rear_mm is None:
+            rear_bumper_y_back_mm = (
+                lidar_config.sensor_to_rear_axle_y_back_mm
+                + self.rear_axle_to_rear_bumper_mm
+            )
+            sensor_behind_vehicle_rear_mm = -rear_bumper_y_back_mm
+        self.sensor_behind_vehicle_rear_mm = max(
+            0.0,
+            float(sensor_behind_vehicle_rear_mm),
+        )
+        self.park_completion_clearance_mm = max(
+            0.0,
+            float(park_completion_clearance_mm),
         )
         self.pixels_per_mm = (
             geometry_config.expected_slot_width_px
@@ -124,7 +154,13 @@ class LidarSlotGeometryProjector:
         depth_to_back = dot(subtract(back_center, vehicle), direction)
         depth_remaining = dot(subtract(stop_target, vehicle), direction)
         slot_width = distance(entrance_first, entrance_second)
+        slot_depth = distance(entrance_center, back_center)
         slot_center = midpoint(entrance_center, back_center)
+        vehicle_width_px = self.vehicle_width_mm * self.pixels_per_mm
+        vehicle_length_px = self.vehicle_length_mm * self.pixels_per_mm
+        rear_axle_to_rear_bumper_px = (
+            self.rear_axle_to_rear_bumper_mm * self.pixels_per_mm
+        )
 
         # Positive lateral error means the bay center is to the vehicle-right
         # when the bay direction is straight up in the rear-BEV frame.
@@ -137,7 +173,7 @@ class LidarSlotGeometryProjector:
             confirmed
             and confidence >= self.geometry_config.min_geometry_confidence
         )
-        inside_ratio, fully_inside = self._vehicle_inside(points)
+        footprint = self._vehicle_footprint_in_slot(polygon)
 
         return ParkingGeometry(
             found=found,
@@ -152,8 +188,12 @@ class LidarSlotGeometryProjector:
             depth_to_back_px=depth_to_back,
             depth_remaining_px=depth_remaining,
             slot_width_px=slot_width,
+            slot_depth_px=slot_depth,
             vehicle_x_px=vehicle[0],
             vehicle_y_px=vehicle[1],
+            vehicle_width_px=vehicle_width_px,
+            vehicle_length_px=vehicle_length_px,
+            rear_axle_to_rear_bumper_px=rear_axle_to_rear_bumper_px,
             slot_center_x_px=slot_center[0],
             slot_center_y_px=slot_center[1],
             slot_direction_x=direction[0],
@@ -162,39 +202,149 @@ class LidarSlotGeometryProjector:
             back_center_y_px=back_center[1],
             stop_target_x_px=stop_target[0],
             stop_target_y_px=stop_target[1],
-            vehicle_inside_ratio=inside_ratio,
-            vehicle_fully_inside=fully_inside,
+            vehicle_inside_ratio=footprint.inside_ratio,
+            vehicle_fully_inside=footprint.fully_inside,
+            vehicle_footprint_slot_local_mm=(
+                footprint.corners_local_mm
+            ),
+            vehicle_footprint_min_lateral_mm=(
+                footprint.min_lateral_mm
+            ),
+            vehicle_footprint_max_lateral_mm=(
+                footprint.max_lateral_mm
+            ),
+            vehicle_footprint_min_depth_mm=footprint.min_depth_mm,
+            vehicle_footprint_max_depth_mm=footprint.max_depth_mm,
+            park_completion_candidate=(
+                footprint.completion_candidate
+            ),
+            park_completion_reason=footprint.reason,
             confidence=confidence,
             observed_line_count=0,
             coasted=coasted,
             reason=reason,
         )
 
-    def _vehicle_inside(self, slot_polygon: Sequence[Point]) -> Tuple[float, bool]:
-        axle_x, axle_y = self._rear_axle_pixel()
-        half_width_px = self.vehicle_width_mm * self.pixels_per_mm / 2.0
-        rear_y = axle_y - self.rear_axle_to_rear_bumper_mm * self.pixels_per_mm
-        front_overhang_from_axle = (
-            self.vehicle_length_mm - self.rear_axle_to_rear_bumper_mm
+    def _vehicle_footprint_in_slot(
+        self,
+        slot_polygon: Sequence[Point],
+    ) -> SlotFootprintMeasurement:
+        entrance_center = midpoint(slot_polygon[0], slot_polygon[1])
+        width_axis = normalize(
+            subtract(slot_polygon[1], slot_polygon[0])
         )
-        front_y = axle_y + front_overhang_from_axle * self.pixels_per_mm
-        corners = (
-            (axle_x - half_width_px, rear_y),
-            (axle_x + half_width_px, rear_y),
-            (axle_x + half_width_px, front_y),
-            (axle_x - half_width_px, front_y),
+        depth_axis = normalize(
+            subtract(slot_polygon[3], slot_polygon[0])
         )
-        fully_inside = all(point_in_convex_polygon(point, slot_polygon) for point in corners)
+        slot_width_mm = distance(slot_polygon[0], slot_polygon[1])
+        slot_depth_mm = distance(slot_polygon[0], slot_polygon[3])
+        if (
+            width_axis is None
+            or depth_axis is None
+            or slot_width_mm <= 0.0
+            or slot_depth_mm <= 0.0
+        ):
+            return SlotFootprintMeasurement(
+                corners_local_mm=((0.0, 0.0),) * 4,
+                min_lateral_mm=0.0,
+                max_lateral_mm=0.0,
+                min_depth_mm=0.0,
+                max_depth_mm=0.0,
+                inside_ratio=0.0,
+                fully_inside=False,
+                completion_candidate=False,
+                reason="footprint_slot_frame_invalid",
+            )
+
+        half_vehicle_width = self.vehicle_width_mm / 2.0
+        rear_bumper_y_back = -self.sensor_behind_vehicle_rear_mm
+        front_bumper_y_back = (
+            rear_bumper_y_back - self.vehicle_length_mm
+        )
+        vehicle_corners = (
+            (-half_vehicle_width, front_bumper_y_back),
+            (half_vehicle_width, front_bumper_y_back),
+            (half_vehicle_width, rear_bumper_y_back),
+            (-half_vehicle_width, rear_bumper_y_back),
+        )
+
+        def to_slot_local(point: Point) -> Point:
+            relative = subtract(point, entrance_center)
+            return dot(relative, width_axis), dot(relative, depth_axis)
+
+        corners_local = tuple(
+            to_slot_local(point) for point in vehicle_corners
+        )
+        lateral_values = tuple(point[0] for point in corners_local)
+        depth_values = tuple(point[1] for point in corners_local)
+        minimum_lateral = min(lateral_values)
+        maximum_lateral = max(lateral_values)
+        minimum_depth = min(depth_values)
+        maximum_depth = max(depth_values)
+        half_slot_width = slot_width_mm / 2.0
+        epsilon = 1e-6
+        fully_inside = (
+            minimum_lateral >= -half_slot_width - epsilon
+            and maximum_lateral <= half_slot_width + epsilon
+            and minimum_depth >= -epsilon
+            and maximum_depth <= slot_depth_mm + epsilon
+        )
 
         inside = 0
         total = 0
         for row in range(9):
-            y = rear_y + (front_y - rear_y) * row / 8.0
+            y_back = (
+                front_bumper_y_back
+                + (rear_bumper_y_back - front_bumper_y_back)
+                * row
+                / 8.0
+            )
             for column in range(5):
-                x = axle_x - half_width_px + 2.0 * half_width_px * column / 4.0
+                x_right = (
+                    -half_vehicle_width
+                    + 2.0 * half_vehicle_width * column / 4.0
+                )
+                lateral, depth = to_slot_local((x_right, y_back))
                 total += 1
-                inside += int(point_in_convex_polygon((x, y), slot_polygon))
-        return inside / float(max(1, total)), fully_inside
+                inside += int(
+                    -half_slot_width - epsilon
+                    <= lateral
+                    <= half_slot_width + epsilon
+                    and -epsilon <= depth <= slot_depth_mm + epsilon
+                )
+
+        clearance = self.park_completion_clearance_mm
+        completion_candidate = (
+            minimum_lateral >= -half_slot_width + clearance
+            and maximum_lateral <= half_slot_width - clearance
+            and minimum_depth >= clearance
+            and maximum_depth <= slot_depth_mm - clearance
+        )
+        if completion_candidate:
+            reason = "footprint_inside_fixed_slot"
+        elif minimum_depth < clearance:
+            reason = "footprint_crosses_slot_entrance"
+        elif maximum_depth > slot_depth_mm - clearance:
+            reason = "footprint_crosses_slot_back"
+        elif (
+            minimum_lateral < -half_slot_width + clearance
+            or maximum_lateral > half_slot_width - clearance
+        ):
+            reason = "footprint_crosses_slot_side"
+        else:
+            reason = "footprint_not_complete"
+
+        return SlotFootprintMeasurement(
+            corners_local_mm=corners_local,  # type: ignore[arg-type]
+            min_lateral_mm=minimum_lateral,
+            max_lateral_mm=maximum_lateral,
+            min_depth_mm=minimum_depth,
+            max_depth_mm=maximum_depth,
+            inside_ratio=inside / float(max(1, total)),
+            fully_inside=fully_inside,
+            completion_candidate=completion_candidate,
+            reason=reason,
+        )
 
     def _rear_axle_pixel(self) -> Point:
         return (
