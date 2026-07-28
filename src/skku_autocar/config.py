@@ -62,6 +62,11 @@ class PaperControllerConfig:
     """Values from Hong et al., Figure 9 and Equations (2)-(5)."""
 
     park_hold_s: float = 4.0
+    park_y_threshold_mm: float = 0.0
+    park_y_cross_confirm_scans: int = 2
+    park_heading_tolerance_deg: float = 4.0
+    park_heading_stability_deg: float = 3.0
+    park_confirm_scans: int = 3
     exit_speed: int = 50
     exit_forward_s: float = 4.0
     exit_turn_steering: int = 150
@@ -81,30 +86,25 @@ class PaperControllerConfig:
     pair_max_distance_jump_mm: float = 700.0
     center_observation_scans: int = 4
     side_entry_confirm_scans: int = 3
-    cd_center_confirm_scans: int = 5
+    cd_center_confirm_scans: int = 3
     paper_max_steering: float = 7.0
     actuator_max_steering: int = 150
     actuator_steering_offset: int = 0
     distance_bias_scale_mm: float = 600.0
     entry_start_angle_deg: float = 30.0
     entry_full_steer_angle_deg: float = 30.0
-    cd_target_balance_ratio: float = -0.16
-    cd_full_steer_error_ratio: float = 0.15
-    cd_center_tolerance_ratio: float = 0.025
-    cd_stability_span_ratio: float = 0.04
     cd_steering_max_step: float = 1.0
-    cd_balance_steering_weight: float = 0.45
     parallel_heading_trigger_deg: float = 14.0
     parallel_heading_exit_deg: float = 10.0
-    parallel_heading_tolerance_deg: float = 7.0
+    parallel_heading_tolerance_deg: float = 4.0
     parallel_heading_full_steer_deg: float = 25.0
     parallel_heading_confirm_scans: int = 2
     parallel_heading_missing_scans: int = 3
-    parallel_heading_stability_deg: float = 6.0
+    parallel_heading_stability_deg: float = 3.0
     parallel_cd_missing_exit_scans: int = 3
     parallel_no_improvement_exit_scans: int = 10
     parallel_min_improvement_deg: float = 0.75
-    dist_bias_cd_threshold_mm: float = 250.0
+    dist_bias_cd_threshold_mm: float = 220.0
     recovery_forward_s: float = 3.0
     command_rate_hz: float = 20.0
 
@@ -250,6 +250,16 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("reverse_speed must be negative")
     if controller.inside_reverse_speed >= 0:
         raise ValueError("inside_reverse_speed must be negative")
+    if controller.park_y_threshold_mm < 0.0:
+        raise ValueError("park_y_threshold_mm cannot be negative")
+    if controller.park_y_cross_confirm_scans < 1:
+        raise ValueError("park_y_cross_confirm_scans must be positive")
+    if controller.park_heading_tolerance_deg <= 0.0:
+        raise ValueError("park_heading_tolerance_deg must be positive")
+    if controller.park_heading_stability_deg <= 0.0:
+        raise ValueError("park_heading_stability_deg must be positive")
+    if controller.park_confirm_scans < 1:
+        raise ValueError("park_confirm_scans must be positive")
     if controller.parallel_forward_speed <= 0:
         raise ValueError("parallel_forward_speed must be positive")
     if not (
@@ -289,24 +299,8 @@ def _validate(config: AppConfig) -> None:
         raise ValueError("side_entry_confirm_scans must be positive")
     if controller.cd_center_confirm_scans < 1:
         raise ValueError("cd_center_confirm_scans must be positive")
-    if controller.cd_full_steer_error_ratio <= 0.0:
-        raise ValueError(
-            "cd_full_steer_error_ratio must be positive"
-        )
-    if controller.cd_center_tolerance_ratio <= 0.0:
-        raise ValueError(
-            "cd_center_tolerance_ratio must be positive"
-        )
-    if controller.cd_stability_span_ratio <= 0.0:
-        raise ValueError(
-            "cd_stability_span_ratio must be positive"
-        )
     if controller.cd_steering_max_step <= 0.0:
         raise ValueError("cd_steering_max_step must be positive")
-    if not 0.0 < controller.cd_balance_steering_weight <= 1.0:
-        raise ValueError(
-            "cd_balance_steering_weight must be in (0, 1]"
-        )
     if controller.parallel_heading_trigger_deg <= 0.0:
         raise ValueError(
             "parallel_heading_trigger_deg must be positive"

@@ -114,6 +114,11 @@ class TelemetryRecorder:
                 "cd_balance_error",
                 "cd_balance_span",
                 "cd_center_ready_scans",
+                "park_ready_scans",
+                "park_c_cross_scans",
+                "park_d_cross_scans",
+                "park_c_crossed",
+                "park_d_crossed",
                 "left_side_heading_deg",
                 "left_side_line_points",
                 "left_side_line_extent_mm",
@@ -307,6 +312,11 @@ class TelemetryRecorder:
                 "cd_center_ready_scans": (
                     debug.cd_center_ready_scans
                 ),
+                "park_ready_scans": debug.park_ready_scans,
+                "park_c_cross_scans": debug.park_c_cross_scans,
+                "park_d_cross_scans": debug.park_d_cross_scans,
+                "park_c_crossed": int(debug.park_c_crossed),
+                "park_d_crossed": int(debug.park_d_crossed),
                 "left_side_heading_deg": _optional(
                     (
                         observation.left_side_line.heading_deg
@@ -1171,17 +1181,26 @@ def _show_debug(
             debug.pair_reacquiring,
             debug.center_observation_scans,
         ),
-        "C=%s@y%s D=%s@y%s ratio=%s err=%s span=%s stable=%d/%d"
+        "C=%s@y%s D=%s@y%s ratio=%s span=%s "
+        "headingReady=%d/%d parkReady=%d/%d "
+        "cross C=%d(%d/%d) D=%d(%d/%d)"
         % (
             _fmt(observation.dist_c_mm, 0),
             _fmt(observation.c_y_back_mm, 0),
             _fmt(observation.dist_d_mm, 0),
             _fmt(observation.d_y_back_mm, 0),
             _fmt(debug.cd_balance_ratio, 3),
-            _fmt(debug.cd_balance_error, 3),
             _fmt(debug.cd_balance_span, 3),
             debug.cd_center_ready_scans,
             config.controller.cd_center_confirm_scans,
+            debug.park_ready_scans,
+            config.controller.park_confirm_scans,
+            debug.park_c_crossed,
+            debug.park_c_cross_scans,
+            config.controller.park_y_cross_confirm_scans,
+            debug.park_d_crossed,
+            debug.park_d_cross_scans,
+            config.controller.park_y_cross_confirm_scans,
         ),
         "SIDE LINE L=%sdeg(%dpt) R=%sdeg(%dpt)"
         % (
