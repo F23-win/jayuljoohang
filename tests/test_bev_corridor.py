@@ -516,6 +516,7 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
             "corridor_tier1:target_lane1:lane_change_reacquired",
         )
         self.assertEqual(estimator.last_class_name, "left-side+center")
+        self.assertEqual(estimator.last_centerline_lane_index, 1)
         self.assertGreater(reacquired.center_x, before.center_x + 40.0)
 
     def test_lane1_target_uses_real_left_side_and_center_corridor(self):
@@ -545,6 +546,7 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
 
         self.assertEqual(target.reason, "corridor_tier1:target_lane1")
         self.assertEqual(estimator.last_class_name, "left-side+center")
+        self.assertEqual(estimator.last_centerline_lane_index, 1)
         self.assertAlmostEqual(target.center_x, 71.5, delta=0.5)
 
     def test_obstacle_lane_change_reacquire_never_bypasses_crosswalk_transit(self):
@@ -590,6 +592,7 @@ class BevCorridorCrosswalkTest(unittest.TestCase):
 
         self.assertTrue(during.reason.startswith("crosswalk_transit_hold:"))
         self.assertNotIn("lane_change_reacquired", during.reason)
+        self.assertEqual(estimator.last_centerline_lane_index, 2)
         self.assertAlmostEqual(during.center_x, before.center_x, delta=0.2)
 
     def test_virtual_hold_preserves_last_curve_direction(self):

@@ -213,17 +213,23 @@ class ObstacleDriveMode:
         self._lane_change.resume(now)
         self._crosswalk_offset_px = None
 
+        centerline_lane_index = getattr(
+            self._corridor_estimator,
+            "last_centerline_lane_index",
+            2,
+        )
         frame_paths = build_obstacle_frame_paths(
             self._transformer,
             self._corridor_estimator.last_centerline_bev,
             self._planner.config.lane_width_px,
             frame_shape[:2],
-            lane2_left_boundary=getattr(
+            base_lane_index=centerline_lane_index,
+            base_left_boundary=getattr(
                 self._corridor_estimator,
                 "last_center_line_bev",
                 (),
             ),
-            lane2_right_boundary=getattr(
+            base_right_boundary=getattr(
                 self._corridor_estimator,
                 "last_right_line_bev",
                 (),
@@ -248,6 +254,7 @@ class ObstacleDriveMode:
             frame_obstacle_masks=class_masks.obstacle,
             frame_paths=frame_paths,
             obstacle_confidence=planning_confidence,
+            base_centerline_lane_index=centerline_lane_index,
         )
         if event:
             LOG.info("%s", event)
@@ -481,56 +488,82 @@ def build_obstacle_frame_paths(
     base_centerline: list,
     lane_width_px: float,
     frame_hw: tuple,
-    lane2_left_boundary: tuple = (),
-    lane2_right_boundary: tuple = (),
+    base_lane_index: int = 2,
+    base_left_boundary: tuple = (),
+    base_right_boundary: tuple = (),
     frame_center_masks: tuple = (),
     frame_side_masks: tuple = (),
 ) -> Optional[FramePathGeometry]:
     if len(base_centerline) < 2:
         return None
     width = max(0.0, float(lane_width_px))
-    lane2_bev = [(float(x), float(y)) for x, y in base_centerline]
-    lane1_bev = [(float(x) - width, float(y)) for x, y in base_centerline]
+    reference_lane = int(base_lane_index) if base_lane_index in (1, 2) else 2
+    reference_bev = [(float(x), float(y)) for x, y in base_centerline]
+    if reference_lane == 1:
+        lane1_bev = reference_bev
+        lane2_bev = [(x + width, y) for x, y in reference_bev]
+    else:
+        lane2_bev = reference_bev
+        lane1_bev = [(x - width, y) for x, y in reference_bev]
     lane1_frame = transformer.bev_to_frame(lane1_bev, frame_hw)
     lane2_frame = transformer.bev_to_frame(lane2_bev, frame_hw)
     left_frame = (
-        transformer.bev_to_frame(lane2_left_boundary, frame_hw)
-        if len(lane2_left_boundary) >= 2
+        transformer.bev_to_frame(base_left_boundary, frame_hw)
+        if len(base_left_boundary) >= 2
         else ()
     )
     right_frame = (
-        transformer.bev_to_frame(lane2_right_boundary, frame_hw)
-        if len(lane2_right_boundary) >= 2
+        transformer.bev_to_frame(base_right_boundary, frame_hw)
+        if len(base_right_boundary) >= 2
         else ()
     )
     # Raw lane masks extend above the BEV source trapezoid. They prevent a far,
     # off-track object from being classified against a projected boundary that
     # has clamped to its first valid BEV point.
-    direct_left = _frame_boundary_from_masks(
-        frame_center_masks,
-        left_frame,
-        merge_instances=True,
-    )
-    direct_right = _frame_boundary_from_masks(
-        frame_side_masks,
-        right_frame,
-        merge_instances=False,
-    )
+    if reference_lane == 1:
+        direct_left = _frame_boundary_from_masks(
+            frame_side_masks,
+            left_frame,
+            merge_instances=False,
+        )
+        direct_right = _frame_boundary_from_masks(
+            frame_center_masks,
+            right_frame,
+            merge_instances=True,
+        )
+    else:
+        direct_left = _frame_boundary_from_masks(
+            frame_center_masks,
+            left_frame,
+            merge_instances=True,
+        )
+        direct_right = _frame_boundary_from_masks(
+            frame_side_masks,
+            right_frame,
+            merge_instances=False,
+        )
     if len(direct_left) >= 2:
         left_frame = direct_left
     if len(direct_right) >= 2:
         right_frame = direct_right
+    boundaries = dict(
+        lane1_left_boundary=(),
+        lane1_right_boundary=(),
+        lane2_left_boundary=(),
+        lane2_right_boundary=(),
+    )
+    boundaries["lane%d_left_boundary" % reference_lane] = tuple(
+        (float(x), float(y))
+        for x, y in left_frame
+    )
+    boundaries["lane%d_right_boundary" % reference_lane] = tuple(
+        (float(x), float(y))
+        for x, y in right_frame
+    )
     return FramePathGeometry(
         lane1=tuple((float(x), float(y)) for x, y in lane1_frame),
         lane2=tuple((float(x), float(y)) for x, y in lane2_frame),
-        lane2_left_boundary=tuple(
-            (float(x), float(y))
-            for x, y in left_frame
-        ),
-        lane2_right_boundary=tuple(
-            (float(x), float(y))
-            for x, y in right_frame
-        ),
+        **boundaries,
     )
 
 

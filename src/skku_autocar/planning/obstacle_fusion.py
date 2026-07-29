@@ -68,6 +68,8 @@ class FramePathGeometry:
     lane2: Tuple[Tuple[float, float], ...] = ()
     lane2_left_boundary: Tuple[Tuple[float, float], ...] = ()
     lane2_right_boundary: Tuple[Tuple[float, float], ...] = ()
+    lane1_left_boundary: Tuple[Tuple[float, float], ...] = ()
+    lane1_right_boundary: Tuple[Tuple[float, float], ...] = ()
 
     def line(self, lane_index: int) -> Tuple[Tuple[float, float], ...]:
         return self.lane1 if lane_index == 1 else self.lane2
@@ -81,12 +83,16 @@ class FramePathGeometry:
             Tuple[Tuple[float, float], ...],
         ]
     ]:
-        if (
-            lane_index == 2
-            and len(self.lane2_left_boundary) >= 2
-            and len(self.lane2_right_boundary) >= 2
-        ):
-            return self.lane2_left_boundary, self.lane2_right_boundary
+        if lane_index == 1:
+            left = self.lane1_left_boundary
+            right = self.lane1_right_boundary
+        elif lane_index == 2:
+            left = self.lane2_left_boundary
+            right = self.lane2_right_boundary
+        else:
+            return None
+        if len(left) >= 2 and len(right) >= 2:
+            return left, right
         return None
 
 
@@ -197,6 +203,7 @@ class ObstacleFusionPlanner:
         frame_obstacle_masks: Sequence[Any] = (),
         frame_paths: Optional[FramePathGeometry] = None,
         obstacle_confidence: float = 1.0,
+        base_centerline_lane_index: int = 2,
     ) -> Optional[str]:
         path_lane = self._desired_lane(lane_change.state)
         if not self.config.enabled:
@@ -220,6 +227,7 @@ class ObstacleFusionPlanner:
             base_centerline,
             lane,
             path_lane,
+            base_centerline_lane_index,
         )
         frame_assessment = self._measure_frame_paths(
             frame_obstacle_masks,
@@ -344,7 +352,11 @@ class ObstacleFusionPlanner:
             and request_ready_lane
             and self._path_plan_ready(path_lane)
             and (not self._consumed or current_path_event)
-            and now - self._last_trigger_at >= max(0.0, self.config.cooldown_seconds)
+            and (
+                current_path_event
+                or now - self._last_trigger_at
+                >= max(0.0, self.config.cooldown_seconds)
+            )
         ):
             event = self._request_lane_change(lane_change, now)
             if event is not None:
@@ -640,6 +652,7 @@ class ObstacleFusionPlanner:
         base_centerline: Sequence[Tuple[float, float]],
         lane: LaneGeometry,
         path_lane: int,
+        base_centerline_lane_index: int,
     ) -> PathAssessment:
         import numpy as np
 
@@ -647,7 +660,10 @@ class ObstacleFusionPlanner:
         if height <= 0 or width <= 0:
             return PathAssessment()
 
-        current_offset = self._lane_offset(path_lane)
+        current_offset = self._lane_offset(
+            path_lane,
+            base_centerline_lane_index,
+        )
         measurements = []
         for mask in obstacle_masks:
             binary = np.asarray(mask) > 0
@@ -896,12 +912,22 @@ class ObstacleFusionPlanner:
             self.status_text(),
         )
 
-    def _lane_offset(self, lane_index: int) -> float:
-        return (
-            -max(0.0, float(self.config.lane_width_px))
-            if lane_index == 1
-            else 0.0
+    def _lane_offset(
+        self,
+        lane_index: int,
+        base_centerline_lane_index: int = 2,
+    ) -> float:
+        base_lane = (
+            int(base_centerline_lane_index)
+            if base_centerline_lane_index in (1, 2)
+            else 2
         )
+        target_lane = int(lane_index) if lane_index in (1, 2) else base_lane
+        lane_width = max(0.0, float(self.config.lane_width_px))
+        # Lane 1 is physically left of lane 2 in BEV coordinates. Offset only
+        # by the difference between the requested path and the lane already
+        # represented by base_centerline.
+        return float(target_lane - base_lane) * lane_width
 
     @staticmethod
     def _desired_lane(state: str) -> int:

@@ -1693,8 +1693,17 @@ def draw_debug(
                 "Y" if light_observation.stop_latched else "N",
             )
         )
+    centerline_lane = _centerline_lane_label(bev_estimator)
     if lane_change_status != "off":
-        lines.append("lane_change=%s" % lane_change_status.upper())
+        lines.append(
+            "lane_change=%s centerline_lane=%s"
+            % (
+                lane_change_status.upper(),
+                centerline_lane,
+            )
+        )
+    elif bev_estimator is not None:
+        lines.append("centerline_lane=%s" % centerline_lane)
     if obstacle_status != "off":
         lines.append("obstacle=%s" % obstacle_status)
     for index, line in enumerate(lines):
@@ -1709,6 +1718,11 @@ def draw_debug(
             cv2.LINE_AA,
         )
     return display
+
+
+def _centerline_lane_label(bev_estimator: Any) -> str:
+    lane_index = getattr(bev_estimator, "last_centerline_lane_index", None)
+    return "L%d" % int(lane_index) if lane_index in (1, 2) else "n/a"
 
 
 def _control_state(reason: str) -> str:

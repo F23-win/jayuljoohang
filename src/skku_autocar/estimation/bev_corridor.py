@@ -260,6 +260,12 @@ class BevCorridorLaneEstimator:
         self.last_centerline_bev: List[Tuple[float, float]] = []
         self.last_center_line_bev: List[Tuple[float, float]] = []
         self.last_right_line_bev: List[Tuple[float, float]] = []
+        # Physical lane represented by last_centerline_bev. Ordinary
+        # center+right-side corridors are lane 2; a successfully observed
+        # left-side+center target corridor is lane 1. Obstacle fusion consumes
+        # this identity so an already-reacquired lane-1 centerline is not shifted
+        # left by a second lane width.
+        self.last_centerline_lane_index: int = 2
         self.last_class_name: str = "none"
         self.last_tier: int = 0
         self.last_lane_width_px: float = config.lane_width_px
@@ -543,6 +549,15 @@ class BevCorridorLaneEstimator:
         self._last_raw_heading = raw_heading
         self.last_class_name = class_name
         self.last_tier = tier
+        if observed_target_lane:
+            self.last_centerline_lane_index = int(lane_change_target_lane)
+        elif class_name in (
+            "center+right-side",
+            "center+virtual-right-side",
+        ):
+            # These corridors use the center marking as the left boundary and
+            # therefore describe the physical right lane.
+            self.last_centerline_lane_index = 2
         current_path = self._fixed_path_points(centerline_fit, bev.shape)
         if lane_change_reacquired:
             # The camera has crossed the divider and the adjacent physical
@@ -1879,6 +1894,7 @@ class BevCorridorLaneEstimator:
         self.last_centerline_bev = []
         self.last_center_line_bev = []
         self.last_right_line_bev = []
+        self.last_centerline_lane_index = 2
         self.last_class_name = "none"
         self.last_tier = 0
         self.last_crosswalk_visible = False

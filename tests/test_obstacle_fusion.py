@@ -22,11 +22,13 @@ from skku_autocar.runtime.obstacle_mode import (
     ObstacleDriveMode,
     _frame_boundary_from_masks,
     build_lane_change_config,
+    build_obstacle_frame_paths,
     build_obstacle_fusion_config,
     lane_change_geometry_reliable,
     resolve_lane_change_target_width_px,
 )
 from skku_autocar.runtime.yolo_drive_app import (
+    _centerline_lane_label,
     parse_args,
 )
 from skku_autocar.sensors.ultrasonic import SENSOR_KEYS, UltrasonicSnapshot
@@ -107,6 +109,40 @@ def planner(**overrides):
 
 
 class ObstacleFusionPlannerTest(unittest.TestCase):
+    def test_debug_centerline_lane_label_uses_physical_reference_lane(self):
+        estimator = FakeCorridorEstimator()
+        self.assertEqual(_centerline_lane_label(estimator), "L2")
+
+        estimator.last_centerline_lane_index = 1
+        self.assertEqual(_centerline_lane_label(estimator), "L1")
+
+    def test_frame_paths_keep_reacquired_lane1_as_lane1_reference(self):
+        lane1_center = [(80.0, float(y)) for y in range(0, 100, 5)]
+        lane1_left = [(50.0, float(y)) for y in range(0, 100, 5)]
+        lane1_right = [(110.0, float(y)) for y in range(0, 100, 5)]
+
+        paths = build_obstacle_frame_paths(
+            IdentityTransformer(),
+            lane1_center,
+            60.0,
+            SHAPE,
+            base_lane_index=1,
+            base_left_boundary=lane1_left,
+            base_right_boundary=lane1_right,
+        )
+
+        self.assertIsNotNone(paths)
+        self.assertEqual(paths.lane1, tuple(lane1_center))
+        self.assertEqual(
+            paths.lane2,
+            tuple((140.0, float(y)) for y in range(0, 100, 5)),
+        )
+        self.assertEqual(
+            paths.physical_bounds(1),
+            (tuple(lane1_left), tuple(lane1_right)),
+        )
+        self.assertIsNone(paths.physical_bounds(2))
+
     def test_frame_boundary_prefers_raw_side_mask_nearest_bev_reference(self):
         left = np.zeros(SHAPE, dtype=np.uint8)
         right = np.zeros(SHAPE, dtype=np.uint8)
@@ -1113,6 +1149,105 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertIn("lane1 -> lane2", second)
         self.assertEqual(change.return_source, "obstacle_fusion")
 
+    def test_reacquired_lane1_obstacle_requests_immediate_return(self):
+        fusion = planner(
+            visual_confirm_frames=1,
+            rearm_clear_frames=4,
+        )
+        change = controller()
+        lane2_mask = obstacle_mask(130, 151, 45, 70)
+        lane1_center = [(80.0, float(y)) for y in range(0, 100, 5)]
+        lane1_mask = obstacle_mask(70, 91, 45, 70)
+
+        first_event = fusion.update(
+            [lane2_mask],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            ultrasound(),
+            1.0,
+            True,
+            base_centerline_lane_index=2,
+        )
+        self.assertIn("lane2 -> lane1", first_event)
+        change.state = "stabilizing_lane1"
+
+        return_event = fusion.update(
+            [lane1_mask],
+            SHAPE,
+            lane1_center,
+            replace(lane(), center_x=80.0),
+            change,
+            ultrasound(),
+            1.1,
+            True,
+            base_centerline_lane_index=1,
+        )
+
+        self.assertIn("lane1 -> lane2", return_event)
+        self.assertEqual(change.return_source, "obstacle_fusion")
+
+    def test_reacquired_lane1_ignores_first_obstacle_exiting_right(self):
+        fusion = planner(
+            visual_confirm_frames=1,
+            rearm_clear_frames=4,
+        )
+        change = controller()
+        lane2_mask = obstacle_mask(130, 151, 45, 70)
+        lane1_center = [(80.0, float(y)) for y in range(0, 100, 5)]
+
+        first_event = fusion.update(
+            [lane2_mask],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            ultrasound(),
+            1.0,
+            True,
+            base_centerline_lane_index=2,
+        )
+        self.assertIn("lane2 -> lane1", first_event)
+        change.state = "stabilizing_lane1"
+
+        exiting_first = fusion.update(
+            [lane2_mask],
+            SHAPE,
+            lane1_center,
+            replace(lane(), center_x=80.0),
+            change,
+            ultrasound(),
+            1.1,
+            True,
+            base_centerline_lane_index=1,
+        )
+
+        self.assertIsNone(exiting_first)
+        self.assertEqual(change.state, "stabilizing_lane1")
+        self.assertEqual(change.return_source, "none")
+        self.assertFalse(fusion.observation.visual_detected)
+
+    def test_explicit_lane2_reference_keeps_normal_avoidance_behavior(self):
+        fusion = planner(visual_confirm_frames=1)
+        change = controller()
+        lane2_mask = obstacle_mask(130, 151, 45, 70)
+
+        event = fusion.update(
+            [lane2_mask],
+            SHAPE,
+            CENTERLINE,
+            lane(),
+            change,
+            ultrasound(),
+            1.0,
+            True,
+            base_centerline_lane_index=2,
+        )
+
+        self.assertIn("lane2 -> lane1", event)
+        self.assertEqual(change.state, "armed")
+
     def test_new_path_obstacle_triggers_after_lane_switch(self):
         fusion = planner(
             rearm_clear_frames=4,
@@ -1478,6 +1613,92 @@ class ObstacleFusionPlannerTest(unittest.TestCase):
         self.assertTrue(mode.enabled)
         self.assertEqual(vehicle.lines, ["USON", "USOFF"])
 
+    def test_obstacle_mode_passes_reacquired_lane1_identity_to_fusion(self):
+        args = parse_args(
+            [
+                "--obstacle-fusion-mode",
+                "yolo",
+                "--obstacle-local-map",
+                "off",
+                "--obstacle-visual-confirm-frames",
+                "1",
+            ]
+        )
+        estimator = FakeCorridorEstimator()
+        mode = ObstacleDriveMode(args, IdentityTransformer(), estimator)
+        mask_result = YoloLaneMask(
+            mask=np.zeros(SHAPE, dtype=np.uint8),
+            confidence=1.0,
+            class_id=0,
+            class_name="left-side+center",
+            device="cpu",
+            inference_ms=0.0,
+        )
+        lane2_mask = obstacle_mask(130, 151, 45, 70)
+        lane2_geometry = replace(
+            lane(),
+            path_points=tuple(CENTERLINE),
+        )
+
+        mode.update(
+            YoloClassMasks(
+                obstacle=(lane2_mask,),
+                obstacle_conf=0.96,
+            ),
+            BevClassMasks(
+                obstacle=[lane2_mask],
+                obstacle_conf=0.96,
+                shape=SHAPE,
+            ),
+            lane2_geometry,
+            mask_result,
+            SHAPE,
+            now=1.0,
+            running=True,
+        )
+        self.assertEqual(mode._lane_change.request_source, "obstacle_fusion")
+
+        lane1_center = [(80.0, float(y)) for y in range(0, 100, 5)]
+        estimator.last_centerline_bev = lane1_center
+        estimator.last_center_line_bev = [
+            (50.0, float(y)) for y in range(0, 100, 5)
+        ]
+        estimator.last_right_line_bev = [
+            (110.0, float(y)) for y in range(0, 100, 5)
+        ]
+        estimator.last_centerline_lane_index = 1
+        mode._lane_change.state = "stabilizing_lane1"
+        lane1_mask = obstacle_mask(70, 91, 45, 70)
+        lane1_geometry = replace(
+            lane(),
+            center_x=80.0,
+            lateral_error_px=-20.0,
+            lateral_error_norm=-0.2,
+            reason="corridor_tier1:target_lane1",
+            path_points=tuple(lane1_center),
+        )
+
+        mode.update(
+            YoloClassMasks(
+                obstacle=(lane1_mask,),
+                obstacle_conf=0.96,
+            ),
+            BevClassMasks(
+                obstacle=[lane1_mask],
+                obstacle_conf=0.96,
+                shape=SHAPE,
+            ),
+            lane1_geometry,
+            mask_result,
+            SHAPE,
+            now=1.1,
+            running=True,
+        )
+
+        self.assertEqual(mode._planner.observation.path_lane, 1)
+        self.assertTrue(mode._planner.observation.visual_detected)
+        self.assertEqual(mode._lane_change.return_source, "obstacle_fusion")
+
     def test_crosswalk_priority_updates_path_with_fixed_obstacle_offset(self):
         args = parse_args(["--obstacle-fusion-mode", "yolo"])
         estimator = FakeCorridorEstimator()
@@ -1568,6 +1789,13 @@ class IdentityTransformer:
 class FakeCorridorEstimator:
     def __init__(self):
         self.last_centerline_bev = list(CENTERLINE)
+        self.last_center_line_bev = [
+            (110.0, float(y)) for y in range(0, 100, 5)
+        ]
+        self.last_right_line_bev = [
+            (170.0, float(y)) for y in range(0, 100, 5)
+        ]
+        self.last_centerline_lane_index = 2
         self.last_lane_width_px = 60.0
         self.last_crosswalk_visible = False
 
